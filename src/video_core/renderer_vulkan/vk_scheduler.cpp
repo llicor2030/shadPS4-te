@@ -195,7 +195,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // NVIDIA workaround: NVIDIA drivers (observed on 610.88) can deadlock at the driver level
     // (nvlddmkm TDR event 153) when graphics queue submissions overlap in execution.
-    // This fully serializes GPU work.
     if (instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) {
         instance.GetGraphicsQueue().waitIdle();
     }

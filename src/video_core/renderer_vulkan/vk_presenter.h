@@ -136,9 +136,12 @@ private:
     std::vector<VAddr> vo_buffers_addr;
 
     // NVIDIA workaround: staging image used to route the swapchain image through a
-    // copy-out/copy-in pass before present (mimics what RenderDoc's capture does).
+    // copy-out/copy-in pass before present. It must always match the swapchain image
+    // exactly, so its current size is tracked and it is rebuilt when the swapchain
+    // is resized.
     vk::Image present_staging{};
     VmaAllocation present_staging_alloc{};
+    vk::Extent2D present_staging_extent{};
 };
 
 } // namespace Vulkan

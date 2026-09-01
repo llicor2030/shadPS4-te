@@ -168,8 +168,14 @@ void Swapchain::FindPresentFormat() {
 
     // If there is a single undefined surface format, the device doesn't care, so we'll just use
     // RGBA sRGB.
+    // NVIDIA workaround: NVIDIA 610.88 deadlocks in the swapchain present path when the
+    // surface format is R8G8B8A8 (TDR after ~10-40 presents). BGRA is what the Windows
+    // compositor uses natively and routes around the driver bug.
+    const bool nvidia_force_bgra = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
+
     if (formats[0].format == vk::Format::eUndefined) {
-        surface_format.format = vk::Format::eR8G8B8A8Unorm;
+        surface_format.format =
+            nvidia_force_bgra ? vk::Format::eB8G8R8A8Unorm : vk::Format::eR8G8B8A8Unorm;
         surface_format.colorSpace = vk::ColorSpaceKHR::eSrgbNonlinear;
         return;
     }
@@ -177,7 +183,11 @@ void Swapchain::FindPresentFormat() {
     // Try to find a suitable format.
     for (const vk::SurfaceFormatKHR& sformat : formats) {
         vk::Format format = sformat.format;
-        if (format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eB8G8R8A8Unorm) {
+        if (nvidia_force_bgra) {
+            if (format != vk::Format::eB8G8R8A8Unorm) {
+                continue;
+            }
+        } else if (format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eB8G8R8A8Unorm) {
             continue;
         }
 

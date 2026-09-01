@@ -193,6 +193,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
+    // NVIDIA workaround: NVIDIA drivers (observed on 610.88) can deadlock at the driver level
+    // (nvlddmkm TDR event 153) when graphics queue submissions overlap in execution.
+    // This fully serializes GPU work.
+    if (instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) {
+        instance.GetGraphicsQueue().waitIdle();
+    }
+
     master_semaphore.Refresh();
     AllocateWorkerCommandBuffers();
 

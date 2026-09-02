@@ -330,11 +330,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
-        // NVIDIA workaround: creating a pipeline while the GPU is still executing previously
-        // submitted frames can deadlock the driver (nvlddmkm TDR event 153).
-        if (instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) {
-            instance.GetGraphicsQueue().waitIdle();
-        }
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
@@ -365,10 +360,6 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
-        // NVIDIA workaround: see GetGraphicsPipeline().
-        if (instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) {
-            instance.GetGraphicsQueue().waitIdle();
-        }
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);

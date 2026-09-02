@@ -152,10 +152,6 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
         .stage = shader_ci,
         .layout = *pl_layout,
     };
-    // NVIDIA workaround: serialize before tiling pipeline creation.
-    if (instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) {
-        instance.GetGraphicsQueue().waitIdle();
-    }
     auto [result, pipeline] =
         device.createComputePipelineUnique(VK_NULL_HANDLE, compute_pipeline_ci);
     ASSERT_MSG(result == vk::Result::eSuccess, "Detiler pipeline creation failed {}",

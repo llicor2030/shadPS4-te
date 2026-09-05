@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -18,6 +20,19 @@
 #include "core/libraries/libs.h"
 
 namespace Libraries::AudioOut {
+
+// AODBG: monotonic microseconds since the first call. sceAudioOutOutput is
+// where the guest mixer is paced, so the gap between consecutive calls on a
+// port is the clock nusc actually runs on.
+static u64 AoDbgNowUs() {
+    static const auto start = std::chrono::steady_clock::now();
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
+// AODBG: last sceAudioOutOutput timestamp per port, for the dt column.
+static std::atomic<u64> g_ao_dbg_last[32]{};
 
 // Port table with shared_ptr - use std::shared_mutex for RW locking
 std::array<std::shared_ptr<PortOut>, ORBIS_AUDIO_OUT_NUM_PORTS> port_table{};
@@ -455,6 +470,11 @@ s32 PS4_SYSV_ABI sceAudioOutGetLastOutputTime(s32 handle, u64* output_time) {
     std::unique_lock lock{port->mutex};
     *output_time = port->last_output_time;
 
+    // AODBG: the play position the guest reads back. If the mixer retires a
+    // voice on a clock, this is where that clock comes from.
+    LOG_INFO(Lib_AudioOut, "[AODBG] lastout handle={:#x} port={} -> {}", handle, port_id,
+             *output_time);
+
     return ORBIS_OK;
 }
 
@@ -567,12 +587,25 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
     }
 
+    // AODBG: t is when the guest entered, wait is how long the pacing wait
+    // held it, dt is the gap from the previous call on this port. That gap is
+    // the clock the guest mixer runs on.
+    const u64 dbg_t0 = AoDbgNowUs();
+    u64 dbg_wait_us = 0;
+    u64 dbg_last_out = 0;
+    u32 dbg_frames = 0;
+    u32 dbg_channels = 0;
+
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
         port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
+        dbg_wait_us = AoDbgNowUs() - dbg_t0;
 
         if (port->closing) {
+            LOG_INFO(Lib_AudioOut,
+                     "[AODBG] out handle={:#x} port={} CLOSING t={} wait={}", handle, port_id,
+                     dbg_t0, dbg_wait_us);
             LOG_DEBUG(Lib_AudioOut, "Port {} closed while waiting for drain", port_id);
             return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
         }
@@ -582,6 +615,18 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
             port->output_ready = true;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
+        dbg_last_out = port->last_output_time;
+        dbg_frames = port->buffer_frames;
+        dbg_channels = port->format_info.num_channels;
+    }
+
+    if (port_id >= 0 && port_id < 32) {
+        const u64 prev = g_ao_dbg_last[port_id].exchange(dbg_t0);
+        LOG_INFO(Lib_AudioOut,
+                 "[AODBG] out handle={:#x} port={} type={} t={} dt={} wait={} sent={} "
+                 "frames={} ch={} lastout={} ptr={}",
+                 handle, port_id, port_type, dbg_t0, prev == 0 ? 0 : dbg_t0 - prev, dbg_wait_us,
+                 samples_sent, dbg_frames, dbg_channels, dbg_last_out, ptr != nullptr ? 1 : 0);
     }
 
     return samples_sent;
@@ -760,6 +805,11 @@ s32 PS4_SYSV_ABI sceAudioOutSetVolume(s32 handle, s32 flag, s32* vol) {
         port->volume[7] = *vol;
 
     port->impl->SetVolume(port->volume);
+
+    // AODBG: port volume only. nusc mixes its voices in software, so a voice
+    // muted by the game never shows up here - but a port going quiet does.
+    LOG_INFO(Lib_AudioOut, "[AODBG] vol handle={:#x} port={} flag={:#x} vol={}", handle, port_id,
+             flag, *vol);
 
     return ORBIS_OK;
 }

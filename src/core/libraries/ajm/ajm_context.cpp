@@ -185,6 +185,11 @@ s32 AjmContext::InstanceCreate(AjmCodecType codec_type, AjmInstanceFlags flags, 
 
 s32 AjmContext::InstanceDestroy(u32 instance_id) {
     std::unique_lock lock(instances_mutex);
+    // AJMDBG: dump the voice's final state before the slot goes away.
+    if (auto* p_instance = instances.Get(instance_id & INSTANCE_ID_MASK);
+        p_instance != nullptr && *p_instance != nullptr) {
+        (*p_instance)->DbgDump(instance_id);
+    }
     if (!instances.Destroy(instance_id & INSTANCE_ID_MASK)) {
         return ORBIS_AJM_ERROR_INVALID_INSTANCE;
     }

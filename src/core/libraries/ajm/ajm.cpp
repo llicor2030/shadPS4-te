@@ -46,7 +46,11 @@ int PS4_SYSV_ABI sceAjmBatchCancel(const u32 context_id, const u32 batch_id) {
         return ORBIS_AJM_ERROR_INVALID_CONTEXT;
     }
 
-    return it->second->BatchCancel(batch_id);
+    // AJMDBG: an explicit cancel from the guest is a decision, not an error.
+    const int dbg_ret = it->second->BatchCancel(batch_id);
+    LOG_INFO(Lib_Ajm, "[AJMDBG] batch cancel ctx={} id={} -> {:#x}", context_id, batch_id,
+             dbg_ret);
+    return dbg_ret;
 }
 
 int PS4_SYSV_ABI sceAjmBatchErrorDump() {
@@ -102,7 +106,14 @@ int PS4_SYSV_ABI sceAjmBatchStartBuffer(u32 context_id, u8* p_batch, u32 batch_s
         return ORBIS_AJM_ERROR_INVALID_CONTEXT;
     }
 
-    return it->second->BatchStartBuffer(p_batch, batch_size, priority, batch_error, out_batch_id);
+    // AJMDBG: the return code the guest gets back for a submit.
+    const int dbg_ret =
+        it->second->BatchStartBuffer(p_batch, batch_size, priority, batch_error, out_batch_id);
+    if (dbg_ret != 0) {
+        LOG_INFO(Lib_Ajm, "[AJMDBG] batch start FAILED ctx={} size={:#x} -> {:#x}", context_id,
+                 batch_size, dbg_ret);
+    }
+    return dbg_ret;
 }
 
 int PS4_SYSV_ABI sceAjmBatchWait(const u32 context_id, const u32 batch_id, const u32 timeout,
@@ -115,7 +126,14 @@ int PS4_SYSV_ABI sceAjmBatchWait(const u32 context_id, const u32 batch_id, const
         return ORBIS_AJM_ERROR_INVALID_CONTEXT;
     }
 
-    return it->second->BatchWait(batch_id, timeout, batch_error);
+    // AJMDBG: a non-zero wait result is how the guest learns a batch went
+    // wrong. Upstream never logs it.
+    const int dbg_ret = it->second->BatchWait(batch_id, timeout, batch_error);
+    if (dbg_ret != 0) {
+        LOG_INFO(Lib_Ajm, "[AJMDBG] batch wait FAILED ctx={} id={} timeout={} -> {:#x}",
+                 context_id, batch_id, timeout, dbg_ret);
+    }
+    return dbg_ret;
 }
 
 int PS4_SYSV_ABI sceAjmDecAt9ParseConfigData() {

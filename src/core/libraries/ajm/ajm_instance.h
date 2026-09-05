@@ -100,6 +100,12 @@ class AjmInstance {
 public:
     AjmInstance(AjmCodecType codec_type, AjmInstanceFlags flags);
 
+    // AJMDBG: dump this voice's final state. Called from InstanceDestroy, not
+    // from a destructor, so it never runs during static teardown when the
+    // loggers may already be gone. The guest tearing down a healthy voice is
+    // the event we are chasing, and upstream logs only the id.
+    void DbgDump(u32 instance_id) const;
+
     void ExecuteJob(AjmJob& job);
 
 private:
@@ -122,6 +128,8 @@ private:
     u64 m_dbg_in_total{};
     u64 m_dbg_ring_base{};
     u32 m_dbg_jobs{};
+    u32 m_dbg_inst_id{};
+    u64 m_dbg_jobs_total{};
     std::array<u64, 32> m_dbg_ring_hash{};
 };
 

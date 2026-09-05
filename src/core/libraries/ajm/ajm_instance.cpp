@@ -57,6 +57,15 @@ AjmInstance::AjmInstance(AjmCodecType codec_type, AjmInstanceFlags flags) : m_fl
     }
 }
 
+void AjmInstance::DbgDump(u32 instance_id) const {
+    // AJMDBG: the guest tore this voice down. Everything the emulator knew
+    // about it at that moment, in one line.
+    LOG_INFO(Lib_Ajm,
+             "[AJMDBG] DESTROY inst={:#x} jobs={} intotal={} total={} ringbase={:#x} flags={:#x}",
+             instance_id, m_dbg_jobs_total, m_dbg_in_total, m_total_samples, m_dbg_ring_base,
+             m_flags.raw);
+}
+
 void AjmInstance::Reset() {
     m_total_samples = 0;
     m_gapless.Reset();
@@ -215,13 +224,76 @@ void AjmInstance::ExecuteJob(AjmJob& job) {
             }
         }
 
+        // AJMDBG: which output sidebands the guest asked for, and what was
+        // written back into them. The guest reads these to decide how far the
+        // stream has got, so a wrong value here is a wrong decision there.
+        m_dbg_inst_id = job.instance_id;
+        m_dbg_jobs_total++;
+        char sb[8];
+        u32 sbn = 0;
+        if (job.output.p_stream != nullptr) {
+            sb[sbn++] = 'S';
+        }
+        if (job.output.p_format != nullptr) {
+            sb[sbn++] = 'F';
+        }
+        if (job.output.p_codec_info != nullptr) {
+            sb[sbn++] = 'C';
+        }
+        if (job.output.p_gapless_decode != nullptr) {
+            sb[sbn++] = 'G';
+        }
+        if (job.output.p_mframe != nullptr) {
+            sb[sbn++] = 'M';
+        }
+        if (sbn == 0) {
+            sb[sbn++] = '-';
+        }
+        sb[sbn] = '\0';
+
         LOG_INFO(Lib_Ajm,
                  "[AJMDBG] job inst={:#x} addr={:#x} chunks={} in={} consumed={} intotal={} "
                  "out={} written={} frames={} result={:#x} total={} ringbase={:#x} ringchg={} "
-                 "first={}",
+                 "first={} jflags={:#x} run={:#x} ctl={:#x} sb={} sIn={} sOut={} sTot={}",
                  job.instance_id, addr, nchunks, in_size, in_size - in_buf.size(), m_dbg_in_total,
                  out_size, out_size - out_buf.Size(), frames_decoded, job.output.p_result->result,
-                 m_total_samples, m_dbg_ring_base, changed, first_changed);
+                 m_total_samples, m_dbg_ring_base, changed, first_changed, job.flags.raw,
+                 static_cast<u64>(job.flags.run_flags), static_cast<u64>(job.flags.control_flags),
+                 static_cast<const char*>(sb),
+                 job.output.p_stream != nullptr ? job.output.p_stream->input_consumed : -1,
+                 job.output.p_stream != nullptr ? job.output.p_stream->output_written : -1,
+                 job.output.p_stream != nullptr
+                     ? static_cast<s64>(job.output.p_stream->total_decoded_samples)
+                     : -1);
+
+        // The rare ones get their own line so the common job line stays short.
+        if (job.output.p_format != nullptr || job.output.p_gapless_decode != nullptr ||
+            job.output.p_codec_info != nullptr) {
+            const auto* ci =
+                reinterpret_cast<const AjmSidebandDecAt9CodecInfo*>(job.output.p_codec_info);
+            LOG_INFO(Lib_Ajm,
+                     "[AJMDBG] sbx inst={:#x} fmt_ch={} fmt_freq={} fmt_enc={} gap_total={} "
+                     "gap_skip={} gap_skipped={} at9_sfs={} at9_fps={} at9_next={} at9_fs={}",
+                     job.instance_id,
+                     job.output.p_format != nullptr ? s64(job.output.p_format->num_channels) : -1,
+                     job.output.p_format != nullptr ? s64(job.output.p_format->sampl_freq) : -1,
+                     job.output.p_format != nullptr
+                         ? s64(static_cast<u32>(job.output.p_format->sample_encoding))
+                         : -1,
+                     job.output.p_gapless_decode != nullptr
+                         ? s64(job.output.p_gapless_decode->total_samples)
+                         : -1,
+                     job.output.p_gapless_decode != nullptr
+                         ? s64(job.output.p_gapless_decode->skip_samples)
+                         : -1,
+                     job.output.p_gapless_decode != nullptr
+                         ? s64(job.output.p_gapless_decode->skipped_samples)
+                         : -1,
+                     ci != nullptr ? s64(ci->super_frame_size) : -1,
+                     ci != nullptr ? s64(ci->frames_in_super_frame) : -1,
+                     ci != nullptr ? s64(ci->next_frame_size) : -1,
+                     ci != nullptr ? s64(ci->frame_samples) : -1);
+        }
         m_dbg_jobs++;
     }
 }

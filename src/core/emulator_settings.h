@@ -306,13 +306,25 @@ struct DebugSettings {
     Setting<bool> shader_collect{false};     // specific
     Setting<std::string> config_version{""}; // specific
 
+    // THRDBG: apply the guest's pthread priority to the host thread. Upstream
+    // records it in attr.prio and never applies it, so an audio streaming
+    // thread and a bulk asset loader run at the same host priority.
+    Setting<bool> guest_thread_priority{true};
+    // FSDBG: measure how long each read waits for the file lock and how long
+    // the host I/O itself takes.
+    Setting<bool> fs_timing{true};
+
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
             make_override<DebugSettings>("debug_dump", &DebugSettings::debug_dump),
-            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect)};
+            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect),
+            make_override<DebugSettings>("guest_thread_priority",
+                                         &DebugSettings::guest_thread_priority),
+            make_override<DebugSettings>("fs_timing", &DebugSettings::fs_timing)};
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version,
+                                   guest_thread_priority, fs_timing)
 
 // -------------------------------
 // Input settings
@@ -723,6 +735,8 @@ public:
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)
     SETTING_FORWARD_BOOL(m_debug, ShaderCollect, shader_collect)
     SETTING_FORWARD(m_debug, ConfigVersion, config_version)
+    SETTING_FORWARD_BOOL(m_debug, GuestThreadPriority, guest_thread_priority)
+    SETTING_FORWARD_BOOL(m_debug, FsTiming, fs_timing)
 
     // GPU Settings
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)

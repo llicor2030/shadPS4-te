@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <map>
 #include <ranges>
 #include <magic_enum/magic_enum.hpp>
@@ -10,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
+#include "core/emulator_settings.h"
 #include "core/file_sys/devices/console_device.h"
 #include "core/file_sys/devices/deci_tty_device.h"
 #include "core/file_sys/devices/logger.h"
@@ -76,6 +78,16 @@ static std::map<std::string, FactoryDevice> available_device = {
 };
 
 namespace Libraries::Kernel {
+
+// FSDBG: monotonic microseconds. Used to split a read into "waited for the
+// file lock" and "spent in host I/O", so a read that queues behind the asset
+// loader can be told apart from one that is simply slow.
+static u64 FsDbgNowUs() {
+    static const auto start = std::chrono::steady_clock::now();
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
 
 // FSDBG: FNV-1a 64 over the first 4 KiB of what a read returned, so a read's
 // payload can be matched against the bytes the decoder later consumes.
@@ -1028,7 +1040,12 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
         return -1;
     }
 
+    // FSDBG: t0 is before the file lock, t1 after it. The gap is how long this
+    // read waited behind another thread on the same file.
+    const bool dbg_timing = EmulatorSettings.IsFsTiming();
+    const u64 dbg_t0 = dbg_timing ? FsDbgNowUs() : 0;
     std::scoped_lock lk{file->m_mutex};
+    const u64 dbg_t1 = dbg_timing ? FsDbgNowUs() : 0;
     if (file->type == Core::FileSys::FileType::Device) {
         s64 result = file->device->preadv(iov, iovcnt, offset);
         if (result < 0) {
@@ -1060,18 +1077,22 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
     }
     s64 total_read = 0;
     for (s32 i = 0; i < iovcnt; i++) {
-        // FSDBG: which handle, which offset, which destination, what landed.
-        // This is what tells a pool buffer (0x....1a20) from the decode ring.
+        // FSDBG: which handle, which offset, which destination, what landed,
+        // and where the time went. lock= is the wait for the file lock, io= is
+        // the host read itself. If both stay small while the guest is still
+        // re-requesting the same block, the queue is not in the emulator.
+        const u64 dbg_t2 = dbg_timing ? FsDbgNowUs() : 0;
         const s64 got = ReadFile(file, iov[i].iov_base, iov[i].iov_len);
+        const u64 dbg_t3 = dbg_timing ? FsDbgNowUs() : 0;
         const s64 iov_off = offset + total_read;
         total_read += got;
         LOG_INFO(Kernel_Fs,
                  "[FSDBG] pread fd={} file={:#x} iov={}/{} off={:#x} n={} -> {} dst={:#x} "
-                 "h0={:016x} | {}",
+                 "h0={:016x} lock={} io={} | {}",
                  fd, reinterpret_cast<u64>(file), i, iovcnt, iov_off, iov[i].iov_len, got,
                  reinterpret_cast<u64>(iov[i].iov_base),
                  got > 0 ? FsDbgHash64(iov[i].iov_base, static_cast<u64>(got)) : 0ULL,
-                 file->m_guest_name);
+                 dbg_t1 - dbg_t0, dbg_t3 - dbg_t2, file->m_guest_name);
     }
     return total_read;
 }

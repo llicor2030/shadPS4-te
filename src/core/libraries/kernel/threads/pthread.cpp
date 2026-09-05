@@ -10,6 +10,7 @@
 #include <pthread.h>
 #endif
 #include "core/debug_state.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -37,6 +38,80 @@ void _thread_cleanupspecific();
 
 using ThreadDtor = void PS4_SYSV_ABI (*)();
 static ThreadDtor ThreadDtors{};
+
+// THRDBG ---------------------------------------------------------------------
+// Upstream stores the guest thread priority in attr.prio and never applies it
+// (see the "TODO: _thr_setscheduler" in scePthreadSetprio and in
+// posix_pthread_setschedparam). attr.prio is only ever read to order event flag
+// waiters. On PS4 the audio streaming threads sit above the asset loader and
+// preempt bulk file I/O; here every guest thread gets the same host priority,
+// so an audio refill queues behind whatever the loader is doing.
+//
+// ORBIS pthread priorities run 256 (highest) .. 767 (lowest), default 700.
+// This only ever raises a thread - nothing is pushed below normal, and the
+// realtime/time-critical class is never used, so the render thread cannot be
+// starved by this.
+static Common::ThreadPriority ThrDbgGuestPrioToHost(int prio) {
+    if (prio <= 0) {
+        return Common::ThreadPriority::Normal;
+    }
+    if (prio < 300) {
+        return Common::ThreadPriority::VeryHigh;
+    }
+    if (prio < 450) {
+        return Common::ThreadPriority::High;
+    }
+    return Common::ThreadPriority::Normal;
+}
+
+static bool ThrDbgSetHostPriority(uintptr_t handle, Common::ThreadPriority prio) {
+#ifdef _WIN32
+    int win_priority = THREAD_PRIORITY_NORMAL;
+    switch (prio) {
+    case Common::ThreadPriority::VeryHigh:
+        win_priority = THREAD_PRIORITY_HIGHEST;
+        break;
+    case Common::ThreadPriority::High:
+        win_priority = THREAD_PRIORITY_ABOVE_NORMAL;
+        break;
+    default:
+        win_priority = THREAD_PRIORITY_NORMAL;
+        break;
+    }
+    return ::SetThreadPriority(reinterpret_cast<HANDLE>(handle), win_priority) != 0;
+#else
+    // SCHED_OTHER ignores sched_priority on Linux, and changing the policy for a
+    // guest thread would need privileges. Log only on this platform.
+    (void)handle;
+    (void)prio;
+    return false;
+#endif
+}
+
+// NativeThread::native_handle is filled in by the creating thread after
+// CreateThread returns, so a thread that reaches RunThread first would read a
+// null handle. When we are already on the target thread, go through the
+// current-thread API instead - it needs no handle and cannot lose that race.
+static void ThrDbgApplyPriority(Pthread* thread, const char* where, bool self) {
+    if (thread == nullptr) {
+        return;
+    }
+    const int prio = thread->attr.prio;
+    const auto host = ThrDbgGuestPrioToHost(prio);
+    const bool enabled = EmulatorSettings.IsGuestThreadPriority();
+    bool applied = false;
+    if (enabled) {
+        if (self) {
+            Common::SetCurrentThreadPriority(host);
+            applied = true;
+        } else if (thread->native_thr != nullptr) {
+            applied = ThrDbgSetHostPriority(thread->native_thr->GetHandle(), host);
+        }
+    }
+    LOG_INFO(Kernel_Pthread, "[THRDBG] prio {} name={} guest={} host={} self={} applied={}", where,
+             thread->name, prio, static_cast<u32>(host), self ? 1 : 0, applied ? 1 : 0);
+}
+// ---------------------------------------------------------------------------
 
 void PS4_SYSV_ABI _sceKernelSetThreadDtors(ThreadDtor dtor) {
     ThreadDtors = dtor;
@@ -261,6 +336,10 @@ static void* RunThread(void* arg) {
     Core::InitializeTLS();
 
     curthread->native_thr->Initialize();
+
+    // THRDBG: the thread is running now, so the handle is valid. This is the
+    // priority the guest asked for at creation time.
+    ThrDbgApplyPriority(curthread, "start", /*self=*/true);
 
 #ifndef _WIN32
     UnblockPthreadCancelSignal();
@@ -589,10 +668,11 @@ int PS4_SYSV_ABI posix_pthread_setschedparam(PthreadT pthread, SchedPolicy polic
         return 0;
     }
 
-    // TODO: _thr_setscheduler
+    // THRDBG: this is where upstream's "TODO: _thr_setscheduler" was.
     pthread->attr.sched_policy = policy;
     pthread->attr.prio = param->sched_priority;
     pthread->lock->unlock();
+    ThrDbgApplyPriority(pthread, "setschedparam", pthread == g_curthread);
     return 0;
 }
 
@@ -624,11 +704,13 @@ int PS4_SYSV_ABI posix_pthread_setprio(PthreadT thread, int prio) {
     if (thread->attr.sched_policy == SchedPolicy::Other || thread->attr.prio == prio) {
         thread->attr.prio = prio;
     } else {
-        // TODO: _thr_setscheduler
+        // THRDBG: this is where upstream's "TODO: _thr_setscheduler" was.
         thread->attr.prio = prio;
     }
 
     thread->lock->unlock();
+    // THRDBG: outside the thread lock - setting a host priority does not need it.
+    ThrDbgApplyPriority(thread, "setprio", thread == g_curthread);
     if (thread != g_curthread) {
         thread_state->RefDelete(thread);
     }

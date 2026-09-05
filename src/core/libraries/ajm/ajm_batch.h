@@ -46,6 +46,15 @@ struct AjmJob {
     AjmJobFlags flags{};
     Input input;
     Output output;
+
+    // AJMDBG: guest address and size of each input run buffer chunk, recorded
+    // at parse time. job.input.buffer is a copy made at submit time, so without
+    // this the position inside the guest ring is lost.
+    struct DbgChunk {
+        u64 addr;
+        u32 size;
+    };
+    boost::container::small_vector<DbgChunk, 4> dbg_chunks;
 };
 
 struct AjmBatch {

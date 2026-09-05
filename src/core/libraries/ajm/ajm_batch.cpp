@@ -213,6 +213,9 @@ AjmJob AjmJobFromBatchBuffer(u32 instance_id, AjmBatchBuffer batch_buffer) {
         case Identifier::AjmIdentInputRunBuf: {
             auto& buffer = batch_buffer.Consume<AjmChunkBuffer>();
             u8* p_begin = reinterpret_cast<u8*>(buffer.p_address);
+            // AJMDBG: record the guest address before the copy.
+            job.dbg_chunks.push_back(
+                AjmJob::DbgChunk{reinterpret_cast<u64>(p_begin), static_cast<u32>(buffer.size)});
             job.input.buffer.insert(job.input.buffer.end(), p_begin, p_begin + buffer.size);
             break;
         }

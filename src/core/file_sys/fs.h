@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -202,7 +203,19 @@ public:
     void CreateStdHandles();
 
 private:
+    // FDDBG: GetFile() hands out a raw File* with no ownership. When close()
+    // calls DeleteHandle the object is deleted even though another thread may
+    // still be inside posix_preadv on it (see the FIXME upstream left in
+    // close()). CreateHandle() then recycles the lowest free index right away,
+    // so an in-flight read can be retargeted at a different file.
+    //   m_retired    - File objects retired instead of deleted (storage kept)
+    //   m_free_delay - freed descriptor indices waiting to be handed out again
+    static constexpr size_t kFdReuseDelay = 16;
+    static constexpr size_t kFdRetireCap = 4096;
+    static constexpr size_t kFdTableSoftCap = 128;
     std::vector<File*> m_files;
+    std::vector<File*> m_retired;
+    std::deque<int> m_free_delay;
     std::mutex m_mutex;
 };
 

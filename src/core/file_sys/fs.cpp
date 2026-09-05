@@ -539,23 +539,43 @@ int HandleTable::CreateHandle() {
     auto* file = new File{};
     file->is_opened = false;
 
-    int existingFilesNum = m_files.size();
-
-    for (int index = 0; index < existingFilesNum; index++) {
-        if (m_files.at(index) == nullptr) {
+    // FDDBG: hand a freed index back out only after kFdReuseDelay further
+    // allocations. Upstream reuses the lowest free index immediately, so a read
+    // issued just before a close can land on a different file. The soft cap
+    // keeps the table from growing without bound on long sessions.
+    const bool force_reuse = m_files.size() >= kFdTableSoftCap;
+    while (!m_free_delay.empty() && (force_reuse || m_free_delay.size() > kFdReuseDelay)) {
+        const int index = m_free_delay.front();
+        m_free_delay.pop_front();
+        if (index >= 0 && static_cast<size_t>(index) < m_files.size() &&
+            m_files[index] == nullptr) {
             m_files[index] = file;
             return index;
         }
     }
 
     m_files.push_back(file);
-    return m_files.size() - 1;
+    return static_cast<int>(m_files.size()) - 1;
 }
 
 void HandleTable::DeleteHandle(int d) {
     std::scoped_lock lock{m_mutex};
-    delete m_files.at(d);
+    // FDDBG: retire instead of delete. The slot is cleared immediately, so the
+    // descriptor still reports EBADF from here on; only the storage stays alive
+    // until the retire cap evicts it. Deliberately does NOT take File::m_mutex:
+    // close() already closed the backend under that lock, and blocking here
+    // would hold the table mutex while a read is in flight and stall every
+    // other fs call. Nothing is locked while m_mutex is held.
+    if (auto* file = m_files.at(d); file != nullptr) {
+        file->is_opened = false;
+        m_retired.push_back(file);
+        if (m_retired.size() > kFdRetireCap) {
+            delete m_retired.front();
+            m_retired.erase(m_retired.begin());
+        }
+    }
     m_files[d] = nullptr;
+    m_free_delay.push_back(d);
 }
 
 File* HandleTable::GetFile(int d) {

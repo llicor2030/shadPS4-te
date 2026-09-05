@@ -77,6 +77,18 @@ static std::map<std::string, FactoryDevice> available_device = {
 
 namespace Libraries::Kernel {
 
+// FSDBG: FNV-1a 64 over the first 4 KiB of what a read returned, so a read's
+// payload can be matched against the bytes the decoder later consumes.
+static u64 FsDbgHash64(const void* data, u64 size) {
+    const auto* p = static_cast<const u8*>(data);
+    const u64 n = size < 4096 ? size : 4096;
+    u64 h = 0xcbf29ce484222325ULL;
+    for (u64 i = 0; i < n; i++) {
+        h = (h ^ static_cast<u64>(p[i])) * 0x100000001b3ULL;
+    }
+    return h;
+}
+
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
 
@@ -253,6 +265,10 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     }
 
     file->is_opened = true;
+    // FDDBG: record fd and File*. The upstream open/close logs print only the
+    // path, so concurrent handles on the same file cannot be told apart.
+    LOG_INFO(Kernel_Fs, "[FDDBG] open  fd={} file={:#x} path={}", handle,
+             reinterpret_cast<u64>(file), file->m_guest_name);
     return handle;
 }
 
@@ -279,14 +295,20 @@ s32 PS4_SYSV_ABI close(s32 fd) {
         *__Error() = POSIX_EPERM;
         return -1;
     }
-    if (file->type == Core::FileSys::FileType::Regular) {
-        file->handle.reset();
-    } else if (file->type == Core::FileSys::FileType::Socket) {
-        file->socket->Close();
+    // FDDBG: upstream did this without holding file->m_mutex (the FIXME that
+    // used to sit just below), so the backend could be reset while another
+    // thread was using it inside posix_preadv. Close under the lock instead.
+    {
+        std::scoped_lock lk{file->m_mutex};
+        if (file->type == Core::FileSys::FileType::Regular) {
+            file->handle.reset();
+        } else if (file->type == Core::FileSys::FileType::Socket) {
+            file->socket->Close();
+        }
+        file->is_opened = false;
     }
-    file->is_opened = false;
-    LOG_INFO(Kernel_Fs, "Closing {}", file->m_guest_name);
-    // FIXME: Lock file mutex before deleting it?
+    LOG_INFO(Kernel_Fs, "[FDDBG] close fd={} file={:#x} path={}", fd,
+             reinterpret_cast<u64>(file), file->m_guest_name);
     h->DeleteHandle(fd);
     return ORBIS_OK;
 }
@@ -392,9 +414,20 @@ s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
         return -1;
     }
 
+    // FSDBG: readv reads from the current position, so record where it starts.
+    const s64 readv_base = file->Tell();
     s64 total_read = 0;
     for (s32 i = 0; i < iovcnt; i++) {
-        total_read += ReadFile(file, iov[i].iov_base, iov[i].iov_len);
+        const s64 got = ReadFile(file, iov[i].iov_base, iov[i].iov_len);
+        const s64 iov_off = readv_base + total_read;
+        total_read += got;
+        LOG_INFO(Kernel_Fs,
+                 "[FSDBG] readv fd={} file={:#x} iov={}/{} off={:#x} n={} -> {} dst={:#x} "
+                 "h0={:016x} | {}",
+                 fd, reinterpret_cast<u64>(file), i, iovcnt, iov_off, iov[i].iov_len, got,
+                 reinterpret_cast<u64>(iov[i].iov_base),
+                 got > 0 ? FsDbgHash64(iov[i].iov_base, static_cast<u64>(got)) : 0ULL,
+                 file->m_guest_name);
     }
     return total_read;
 }
@@ -1027,7 +1060,18 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
     }
     s64 total_read = 0;
     for (s32 i = 0; i < iovcnt; i++) {
-        total_read += ReadFile(file, iov[i].iov_base, iov[i].iov_len);
+        // FSDBG: which handle, which offset, which destination, what landed.
+        // This is what tells a pool buffer (0x....1a20) from the decode ring.
+        const s64 got = ReadFile(file, iov[i].iov_base, iov[i].iov_len);
+        const s64 iov_off = offset + total_read;
+        total_read += got;
+        LOG_INFO(Kernel_Fs,
+                 "[FSDBG] pread fd={} file={:#x} iov={}/{} off={:#x} n={} -> {} dst={:#x} "
+                 "h0={:016x} | {}",
+                 fd, reinterpret_cast<u64>(file), i, iovcnt, iov_off, iov[i].iov_len, got,
+                 reinterpret_cast<u64>(iov[i].iov_base),
+                 got > 0 ? FsDbgHash64(iov[i].iov_base, static_cast<u64>(got)) : 0ULL,
+                 file->m_guest_name);
     }
     return total_read;
 }

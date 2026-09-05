@@ -9,7 +9,18 @@
 
 #include <magic_enum/magic_enum.hpp>
 
+#include "core/memory.h"
+
 namespace Libraries::Ajm {
+
+// AJMDBG: FNV-1a 64, used to fingerprint each 4 KiB sub-block of the ring.
+static u64 AjmRingHash64(const u8* p, u64 size) {
+    u64 h = 0xcbf29ce484222325ULL;
+    for (u64 i = 0; i < size; i++) {
+        h = (h ^ static_cast<u64>(p[i])) * 0x100000001b3ULL;
+    }
+    return h;
+}
 
 u8 GetPCMSize(AjmFormatEncoding format) {
     switch (format) {
@@ -50,17 +61,23 @@ void AjmInstance::Reset() {
     m_total_samples = 0;
     m_gapless.Reset();
     m_codec->Reset();
+    // AJMDBG: fold the bookkeeping per stream as well.
+    m_dbg_in_total = 0;
+    m_dbg_ring_base = 0;
+    m_dbg_jobs = 0;
+    m_dbg_ring_hash.fill(0);
 }
 
 void AjmInstance::ExecuteJob(AjmJob& job) {
     const auto control_flags = job.flags.control_flags;
     job.output.p_result->result = 0;
     if (True(control_flags & AjmJobControlFlags::Reset)) {
-        LOG_TRACE(Lib_Ajm, "Resetting instance {}", job.instance_id);
+        LOG_INFO(Lib_Ajm, "[AJMDBG] RESET inst={:#x} (was total={} intotal={} ringbase={:#x})",
+                 job.instance_id, m_total_samples, m_dbg_in_total, m_dbg_ring_base);
         Reset();
     }
     if (job.input.init_params.has_value()) {
-        LOG_TRACE(Lib_Ajm, "Initializing instance {}", job.instance_id);
+        LOG_INFO(Lib_Ajm, "[AJMDBG] INIT  inst={:#x}", job.instance_id);
         auto& params = job.input.init_params.value();
         m_codec->Initialize(&params, sizeof(params));
     }
@@ -163,6 +180,49 @@ void AjmInstance::ExecuteJob(AjmJob& job) {
     }
     if (job.output.p_codec_info != nullptr) {
         m_codec->GetInfo(job.output.p_codec_info);
+    }
+
+    // AJMDBG ----------------------------------------------------------------
+    // If intotal tops out at the size of the leading partial read (27,368 for
+    // mode_303) then not one of the 128 KiB refills was ever credited. If it
+    // goes past that, the credit happened and the bytes did not. ringchg says
+    // which part of the ring window actually changed.
+    {
+        const u64 addr = job.dbg_chunks.empty() ? 0 : job.dbg_chunks.front().addr;
+        const u32 nchunks = static_cast<u32>(job.dbg_chunks.size());
+        m_dbg_in_total += static_cast<u64>(in_size);
+        if (addr != 0 && m_dbg_ring_base == 0) {
+            m_dbg_ring_base = addr;
+        }
+
+        u32 changed = 0;
+        s32 first_changed = -1;
+        if (m_dbg_ring_base != 0 && (m_dbg_jobs % 16) == 0) {
+            auto* memory = Core::Memory::Instance();
+            for (u32 i = 0; i < 32; i++) {
+                const VAddr sub = m_dbg_ring_base + static_cast<u64>(i) * 4096;
+                if (!memory->IsValidMapping(sub, 4096)) {
+                    continue;
+                }
+                const u64 h = AjmRingHash64(reinterpret_cast<const u8*>(sub), 4096);
+                if (h != m_dbg_ring_hash[i]) {
+                    m_dbg_ring_hash[i] = h;
+                    changed++;
+                    if (first_changed < 0) {
+                        first_changed = static_cast<s32>(i);
+                    }
+                }
+            }
+        }
+
+        LOG_INFO(Lib_Ajm,
+                 "[AJMDBG] job inst={:#x} addr={:#x} chunks={} in={} consumed={} intotal={} "
+                 "out={} written={} frames={} result={:#x} total={} ringbase={:#x} ringchg={} "
+                 "first={}",
+                 job.instance_id, addr, nchunks, in_size, in_size - in_buf.size(), m_dbg_in_total,
+                 out_size, out_size - out_buf.Size(), frames_decoded, job.output.p_result->result,
+                 m_total_samples, m_dbg_ring_base, changed, first_changed);
+        m_dbg_jobs++;
     }
 }
 

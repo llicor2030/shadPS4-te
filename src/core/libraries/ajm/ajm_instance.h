@@ -8,6 +8,7 @@
 #include "core/libraries/ajm/ajm.h"
 #include "core/libraries/ajm/ajm_batch.h"
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -111,6 +112,17 @@ private:
     AjmSidebandResampleParameters m_resample_parameters{};
     u32 m_total_samples{};
     std::unique_ptr<AjmCodec> m_codec;
+
+    // AJMDBG: per-stream bookkeeping.
+    //   m_dbg_in_total  running total of input bytes the game has handed this
+    //                   instance since the last reset - a proxy for how much of
+    //                   the ring the game believes it has been able to fill.
+    //   m_dbg_ring_base first input address seen after a reset (ring start).
+    //   m_dbg_ring_hash fingerprints of the 0x20000 ring window, 4 KiB x 32.
+    u64 m_dbg_in_total{};
+    u64 m_dbg_ring_base{};
+    u32 m_dbg_jobs{};
+    std::array<u64, 32> m_dbg_ring_hash{};
 };
 
 } // namespace Libraries::Ajm

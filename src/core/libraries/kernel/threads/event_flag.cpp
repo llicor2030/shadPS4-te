@@ -314,7 +314,9 @@ int PS4_SYSV_ABI sceKernelCloseEventFlag() {
 }
 
 int PS4_SYSV_ABI sceKernelClearEventFlag(OrbisKernelEventFlag ef, u64 bitPattern) {
-    LOG_DEBUG(Kernel_Event, "called");
+    // SYNCDBG: Clear(pattern) is an AND, so bits=0 clears everything.
+    LOG_INFO(Kernel_Event, "[SYNCDBG] evf clear ef={:#x} bits={:#x}",
+             reinterpret_cast<u64>(ef), bitPattern);
     if (ef == nullptr) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
@@ -333,7 +335,10 @@ int PS4_SYSV_ABI sceKernelCancelEventFlag(OrbisKernelEventFlag ef, u64 setPatter
 }
 
 int PS4_SYSV_ABI sceKernelSetEventFlag(OrbisKernelEventFlag ef, u64 bitPattern) {
-    LOG_TRACE(Kernel_Event, "called");
+    // SYNCDBG: upstream logs this at TRACE, which is compiled out in Release.
+    // Without the Set side the wait/clear traffic cannot be paired up.
+    LOG_INFO(Kernel_Event, "[SYNCDBG] evf set   ef={:#x} bits={:#x}",
+             reinterpret_cast<u64>(ef), bitPattern);
     if (ef == nullptr) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
@@ -426,10 +431,13 @@ int PS4_SYSV_ABI sceKernelWaitEventFlag(OrbisKernelEventFlag ef, u64 bitPattern,
         UNREACHABLE();
     }
 
+    // SYNCDBG: what the thread is blocked on, and what it woke up with.
+    LOG_INFO(Kernel_Event, "[SYNCDBG] evf wait> ef={:#x} bits={:#x} mode={:#x} timeout={}",
+             reinterpret_cast<u64>(ef), bitPattern, waitMode,
+             pTimeout != nullptr ? *pTimeout : 0);
     const int result = ef->Wait(bitPattern, wait, clear, pResultPat, pTimeout);
-    if (result != ORBIS_OK && result != ORBIS_KERNEL_ERROR_ETIMEDOUT) {
-        LOG_DEBUG(Kernel_Event, "returned {:#x}", result);
-    }
+    LOG_INFO(Kernel_Event, "[SYNCDBG] evf wait< ef={:#x} -> {:#x} pat={:#x}",
+             reinterpret_cast<u64>(ef), result, pResultPat != nullptr ? *pResultPat : 0);
 
     return result;
 }

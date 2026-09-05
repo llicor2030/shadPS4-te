@@ -313,6 +313,9 @@ struct DebugSettings {
     // FSDBG: measure how long each read waits for the file lock and how long
     // the host I/O itself takes.
     Setting<bool> fs_timing{true};
+    // IOSPEED: cap guest file reads to this many MiB/s, as one drive shared by
+    // every thread. 0 keeps upstream behaviour (host speed, no pacing).
+    Setting<u32> disc_read_mbps{0};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -320,11 +323,13 @@ struct DebugSettings {
             make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect),
             make_override<DebugSettings>("guest_thread_priority",
                                          &DebugSettings::guest_thread_priority),
-            make_override<DebugSettings>("fs_timing", &DebugSettings::fs_timing)};
+            make_override<DebugSettings>("fs_timing", &DebugSettings::fs_timing),
+            make_override<DebugSettings>("disc_read_mbps",
+                                         &DebugSettings::disc_read_mbps)};
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version,
-                                   guest_thread_priority, fs_timing)
+                                   guest_thread_priority, fs_timing, disc_read_mbps)
 
 // -------------------------------
 // Input settings
@@ -737,6 +742,7 @@ public:
     SETTING_FORWARD(m_debug, ConfigVersion, config_version)
     SETTING_FORWARD_BOOL(m_debug, GuestThreadPriority, guest_thread_priority)
     SETTING_FORWARD_BOOL(m_debug, FsTiming, fs_timing)
+    SETTING_FORWARD(m_debug, DiscReadMbps, disc_read_mbps)
 
     // GPU Settings
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)

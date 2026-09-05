@@ -3,7 +3,9 @@
 
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <ranges>
+#include <thread>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
@@ -87,6 +89,50 @@ static u64 FsDbgNowUs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - start)
                                 .count());
+}
+
+// IOSPEED ------------------------------------------------------------------
+// Upstream hands guest reads back at host speed. On this machine that measures
+// 319 MiB/s, so a 355 MiB load finishes in 1.1 s where the console needs
+// several seconds. Model one drive shared by every thread: g_io_free_us is when
+// that drive next becomes idle, each caller reserves its slice and waits for it
+// BEFORE taking file->m_mutex - sleeping under that lock would serialise every
+// other access to the same file.
+static std::mutex g_io_throttle_mutex;
+static u64 g_io_free_us = 0;
+static constexpr u64 kIoMaxWaitUs = 10'000'000;
+
+static u64 FsThrottleReserve(u64 bytes) {
+    const u32 mbps = EmulatorSettings.GetDiscReadMbps();
+    if (mbps == 0 || bytes == 0) {
+        return 0;
+    }
+    const u64 cost_us = (bytes * 1'000'000ULL) / (static_cast<u64>(mbps) * 1024ULL * 1024ULL);
+    u64 wait_us = 0;
+    {
+        std::scoped_lock lk{g_io_throttle_mutex};
+        const u64 now = FsDbgNowUs();
+        const u64 start = g_io_free_us > now ? g_io_free_us : now;
+        wait_us = start - now;
+        g_io_free_us = start + cost_us;
+    }
+    if (wait_us > kIoMaxWaitUs) {
+        LOG_WARNING(Kernel_Fs, "[IOSPEED] wait {} us capped to {} us (bytes={})", wait_us,
+                    kIoMaxWaitUs, bytes);
+        wait_us = kIoMaxWaitUs;
+    }
+    if (wait_us > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
+    }
+    return wait_us;
+}
+
+static u64 FsThrottleIovec(const OrbisKernelIovec* iov, s32 iovcnt) {
+    u64 total = 0;
+    for (s32 i = 0; i < iovcnt; i++) {
+        total += iov[i].iov_len;
+    }
+    return FsThrottleReserve(total);
 }
 
 // FSDBG: FNV-1a 64 over the first 4 KiB of what a read returned, so a read's
@@ -404,6 +450,10 @@ s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
         return -1;
     }
 
+    // IOSPEED: pace before any lock is taken.
+    if (file->type == Core::FileSys::FileType::Regular) {
+        FsThrottleIovec(iov, iovcnt);
+    }
     std::scoped_lock lk{file->m_mutex};
     if (file->type == Core::FileSys::FileType::Device) {
         s64 result = file->device->readv(iov, iovcnt);
@@ -577,6 +627,10 @@ s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
         return -1;
     }
 
+    // IOSPEED: pace before any lock is taken.
+    if (file->type == Core::FileSys::FileType::Regular) {
+        FsThrottleReserve(nbytes);
+    }
     std::scoped_lock lk{file->m_mutex};
     if (file->type == Core::FileSys::FileType::Device) {
         s64 result = file->device->read(buf, nbytes);
@@ -1040,6 +1094,10 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
         return -1;
     }
 
+    // IOSPEED: pace before any lock is taken.
+    const u64 dbg_thr = file->type == Core::FileSys::FileType::Regular
+                            ? FsThrottleIovec(iov, iovcnt)
+                            : 0;
     // FSDBG: t0 is before the file lock, t1 after it. The gap is how long this
     // read waited behind another thread on the same file.
     const bool dbg_timing = EmulatorSettings.IsFsTiming();
@@ -1088,11 +1146,11 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
         total_read += got;
         LOG_INFO(Kernel_Fs,
                  "[FSDBG] pread fd={} file={:#x} iov={}/{} off={:#x} n={} -> {} dst={:#x} "
-                 "h0={:016x} lock={} io={} | {}",
+                 "h0={:016x} lock={} io={} thr={} | {}",
                  fd, reinterpret_cast<u64>(file), i, iovcnt, iov_off, iov[i].iov_len, got,
                  reinterpret_cast<u64>(iov[i].iov_base),
                  got > 0 ? FsDbgHash64(iov[i].iov_base, static_cast<u64>(got)) : 0ULL,
-                 dbg_t1 - dbg_t0, dbg_t3 - dbg_t2, file->m_guest_name);
+                 dbg_t1 - dbg_t0, dbg_t3 - dbg_t2, dbg_thr, file->m_guest_name);
     }
     return total_read;
 }

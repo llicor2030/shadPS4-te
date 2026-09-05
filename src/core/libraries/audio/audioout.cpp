@@ -657,6 +657,9 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
     }
 
+    // AODBG: entry timestamp for the wait measurement below.
+    const u64 dbg_t0 = AoDbgNowUs();
+
     std::vector<std::shared_ptr<PortOut>> ports;
     std::vector<std::unique_lock<std::mutex>> locks;
     ports.reserve(num);
@@ -731,6 +734,26 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         if (param[i].ptr != nullptr) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
+        }
+    }
+
+    // AODBG: this is the call the game actually uses - not sceAudioOutOutput.
+    // dt is the gap since this port's previous submit, which is the clock the
+    // guest mixer runs on; wait is how long the pacing wait above held it.
+    {
+        const u64 dbg_t1 = AoDbgNowUs();
+        LOG_INFO(Lib_AudioOut, "[AODBG] outs n={} t={} wait={} frames={}", num, dbg_t1,
+                 dbg_t1 - dbg_t0, buffer_frames);
+        for (u32 i = 0; i < num; i++) {
+            const int dbg_port = GetPortId(param[i].handle);
+            u64 dbg_dt = 0;
+            if (dbg_port >= 0 && dbg_port < 32) {
+                const u64 prev = g_ao_dbg_last[dbg_port].exchange(dbg_t1);
+                dbg_dt = prev == 0 ? 0 : dbg_t1 - prev;
+            }
+            LOG_INFO(Lib_AudioOut, "[AODBG]   +[{}] handle={:#x} port={} type={} dt={} ptr={}", i,
+                     param[i].handle, dbg_port, GetPortType(param[i].handle), dbg_dt,
+                     param[i].ptr != nullptr ? 1 : 0);
         }
     }
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -710,6 +712,39 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+        return;
+    }
+
+    // Devices without VK_FORMAT_D16_UNORM_S8_UINT - which is all NVIDIA hardware - get a wider
+    // depth-stencil format substituted in Instance::GetSupportedFormat when the image is
+    // created, currently D24_UNORM_S8_UINT or D32_SFLOAT_S8_UINT. The guest buffer is still
+    // sized for the original 16-bit depth, but vkCmdCopyBufferToImage derives the region size
+    // from the image's texel size, so the copy reads twice the bytes the buffer holds:
+    //
+    //   VUID-vkCmdCopyBufferToImage-pRegions-00171: trying to copy 16777216 bytes from a
+    //   VkBuffer of 8388608 bytes (2048x2048, blockSize 4, VK_FORMAT_D24_UNORM_S8_UINT)
+    //
+    // That is a real out-of-bounds read. Small surfaces stay inside the same allocation and get
+    // away with it; large ones cross the end of the mapping, fault the GPU, and surface as
+    // VK_ERROR_DEVICE_LOST at the next submit - far from the actual cause.
+    //
+    // Bail out here, before the mip hashing and before TileManager::DetileImage allocates a
+    // scratch buffer and dispatches the detiler. The dirty flag has to be cleared too: leaving
+    // it set makes this image be refreshed again on every pass, which costs far more than the
+    // upload ever did. Depth buffers are cleared before use in practice, so the missing guest
+    // contents are much cheaper than either.
+    if (image.info.pixel_format == vk::Format::eD16UnormS8Uint &&
+        instance.GetSupportedFormat(image.info.pixel_format, image.format_features) !=
+            image.info.pixel_format) {
+        static std::once_flag logged;
+        std::call_once(logged, [&] {
+            LOG_WARNING(Render_Vulkan,
+                        "Skipping guest upload of {}x{} D16_UNORM_S8_UINT images: this device "
+                        "substituted a wider depth-stencil format, and the {} byte guest buffer "
+                        "cannot satisfy the resulting copy. Not logged again.",
+                        image.info.size.width, image.info.size.height, image.info.guest_size);
+        });
+        image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
 

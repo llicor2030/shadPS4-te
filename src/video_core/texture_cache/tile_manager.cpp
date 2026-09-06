@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -10,6 +11,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/tile_manager.h"
 
+#include "video_core/host_shaders/depth_expand_comp.h"
 #include "video_core/host_shaders/tiling_comp.h"
 
 #include <magic_enum/magic_enum.hpp>
@@ -22,6 +24,12 @@ struct TilingInfo {
     u32 num_slices;
     u32 num_mips;
     std::array<ImageInfo::MipInfo, 16> mips;
+};
+
+struct DepthExpandInfo {
+    u32 num_texels;
+    u32 src_index;
+    u32 to_float;
 };
 
 TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -238,6 +246,141 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
+    return {out_buffer, 0};
+}
+
+vk::Pipeline TileManager::GetDepthExpandPipeline() {
+    if (auto pipeline = *depth_expand_pl; pipeline != VK_NULL_HANDLE) {
+        return pipeline;
+    }
+
+    const auto device = instance.GetDevice();
+    const auto& module = Vulkan::Compile(HostShaders::DEPTH_EXPAND_COMP,
+                                         vk::ShaderStageFlagBits::eCompute, device);
+    LOG_INFO(Render_Vulkan, "Compiling shader depth_expand");
+    Vulkan::SetObjectName(device, module, "depth_expand");
+    const vk::PipelineShaderStageCreateInfo shader_ci = {
+        .stage = vk::ShaderStageFlagBits::eCompute,
+        .module = module,
+        .pName = "main",
+    };
+    const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .stage = shader_ci,
+        .layout = *pl_layout,
+    };
+    auto [result, pipeline] =
+        device.createComputePipelineUnique(VK_NULL_HANDLE, compute_pipeline_ci);
+    ASSERT_MSG(result == vk::Result::eSuccess, "Depth expand pipeline creation failed {}",
+               vk::to_string(result));
+    depth_expand_pl = std::move(pipeline);
+    device.destroyShaderModule(module);
+    return *depth_expand_pl;
+}
+
+TileManager::Result TileManager::ExpandDepth16(vk::Buffer in_buffer, u32 in_offset,
+                                               const ImageInfo& info, bool to_float) {
+    ASSERT_MSG(in_offset % sizeof(u16) == 0, "Unaligned depth source offset {}", in_offset);
+
+    const u32 num_texels = info.guest_size / static_cast<u32>(sizeof(u16));
+    const u32 out_size = num_texels * static_cast<u32>(sizeof(u32));
+
+    const DepthExpandInfo params{
+        .num_texels = num_texels,
+        .src_index = in_offset / static_cast<u32>(sizeof(u16)),
+        .to_float = to_float ? 1U : 0U,
+    };
+    const vk::DescriptorBufferInfo params_buffer_info{
+        .buffer = stream_buffer.Handle(),
+        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
+        .range = sizeof(params),
+    };
+
+    const auto [out_buffer, out_allocation] = GetScratchBuffer(out_size);
+    scheduler.DeferOperation([this, out_buffer, out_allocation]() {
+        vmaDestroyBuffer(instance.GetAllocator(), out_buffer, out_allocation);
+    });
+
+    scheduler.EndRendering();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+
+    // The source is either the detiler output or the buffer cache copy of guest memory. Either
+    // way the last writer was not a compute shader read, so make the data visible first.
+    const vk::BufferMemoryBarrier2 pre_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .buffer = in_buffer,
+        .offset = in_offset,
+        .size = info.guest_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &pre_barrier,
+    });
+
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetDepthExpandPipeline());
+
+    // Bound from the start of the buffer so that in_offset does not have to satisfy
+    // minStorageBufferOffsetAlignment; the shader indexes with src_index instead.
+    const vk::DescriptorBufferInfo src_buffer_info{
+        .buffer = in_buffer,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
+    };
+
+    const vk::DescriptorBufferInfo dst_buffer_info{
+        .buffer = out_buffer,
+        .offset = 0,
+        .range = out_size,
+    };
+
+    const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &src_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &dst_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &params_buffer_info,
+        },
+    }};
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    cmdbuf.dispatch(Common::DivCeil(num_texels, 64U), 1, 1);
+
+    const vk::BufferMemoryBarrier2 post_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = out_buffer,
+        .offset = 0,
+        .size = out_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &post_barrier,
+    });
+
     return {out_buffer, 0};
 }
 

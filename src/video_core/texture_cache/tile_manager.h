@@ -29,8 +29,14 @@ public:
 
     Result DetileImage(vk::Buffer in_buffer, u32 in_offset, const ImageInfo& info);
 
+    /// Widens a 16-bit guest depth surface into the 32-bit-per-texel layout expected by
+    /// the host format that D16_UNORM_S8_UINT was substituted with.
+    Result ExpandDepth16(vk::Buffer in_buffer, u32 in_offset, const ImageInfo& info,
+                         bool to_float);
+
 private:
     vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);
+    vk::Pipeline GetDepthExpandPipeline();
     ScratchBuffer GetScratchBuffer(u32 size);
 
 private:
@@ -41,6 +47,7 @@ private:
     vk::UniquePipelineLayout pl_layout;
     std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS> detilers{};
     std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS> tilers{};
+    vk::UniquePipeline depth_expand_pl{};
 };
 
 } // namespace VideoCore

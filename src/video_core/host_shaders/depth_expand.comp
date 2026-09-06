@@ -1,0 +1,45 @@
+// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450 core
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+// Widens a linear 16-bit guest depth surface into the 32-bit-per-texel layout that
+// vkCmdCopyBufferToImage expects for the depth aspect of the host format that
+// D16_UNORM_S8_UINT was substituted with. The mapping is a flat element-wise widening
+// over the whole surface, so every byte offset in the guest layout simply doubles.
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (set = 0, binding = 0, scalar) readonly buffer InputBuf {
+    uint16_t src_data[];
+};
+
+layout (set = 0, binding = 1, scalar) writeonly buffer OutputBuf {
+    uint32_t dst_data[];
+};
+
+layout (set = 0, binding = 2, scalar) uniform ExpandInfo {
+    uint num_texels;
+    uint src_index;
+    uint to_float;
+} info;
+
+void main() {
+    uint32_t index = gl_GlobalInvocationID.x;
+    if (index >= info.num_texels) {
+        return;
+    }
+
+    uint32_t depth16 = uint32_t(src_data[info.src_index + index]);
+    if (info.to_float != 0) {
+        // D32_SFLOAT_S8_UINT: one 32-bit float per texel, normalized to [0, 1].
+        dst_data[index] = floatBitsToUint(float(depth16) * (1.0 / 65535.0));
+    } else {
+        // D24_UNORM_S8_UINT: one 32-bit word per texel with the 24-bit value in the low
+        // bits. Bit replication keeps the endpoints exact (0xFFFF -> 0xFFFFFF).
+        dst_data[index] = (depth16 << 8) | (depth16 >> 8);
+    }
+}

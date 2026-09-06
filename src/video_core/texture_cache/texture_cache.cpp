@@ -73,6 +73,19 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    // Mirror image of the upload problem: download_size is derived from the 16-bit guest
+    // layout while the host image holds 32 bits per depth texel, so the copy would write
+    // twice as much as the download buffer holds. Narrowing back is not implemented yet,
+    // so skip the readback rather than run off the end of the buffer.
+    if (image.info.pixel_format == vk::Format::eD16UnormS8Uint &&
+        instance.GetSupportedFormat(image.info.pixel_format, image.format_features) !=
+            vk::Format::eD16UnormS8Uint) {
+        LOG_WARNING(Render_Vulkan,
+                    "Skipping readback of substituted D16_UNORM_S8_UINT image {:#x}",
+                    image.info.guest_address);
+        return;
+    }
+
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
@@ -794,10 +807,28 @@ void TextureCache::RefreshImage(Image& image) {
         });
     }
 
-    const auto [buffer, offset] =
+    auto [buffer, offset] =
         tile_manager.DetileImage(in_buffer->Handle(), in_offset, image.info);
+
+    // D16_UNORM_S8_UINT is an optional Vulkan format and gets substituted with a 32-bit
+    // depth-stencil format on devices that lack it (all NVIDIA GPUs). The guest surface
+    // stays 16 bits per texel, so a straight copy would make the driver read twice the
+    // data the buffer holds. Widen the depth values into the host layout first.
+    u32 texel_scale = 1;
+    if (image.info.pixel_format == vk::Format::eD16UnormS8Uint) {
+        const auto host_format =
+            instance.GetSupportedFormat(image.info.pixel_format, image.format_features);
+        if (host_format != vk::Format::eD16UnormS8Uint) {
+            const auto expanded = tile_manager.ExpandDepth16(
+                buffer, offset, image.info, host_format == vk::Format::eD32SfloatS8Uint);
+            buffer = expanded.first;
+            offset = expanded.second;
+            texel_scale = 2;
+        }
+    }
+
     for (auto& copy : image_copies) {
-        copy.bufferOffset += offset;
+        copy.bufferOffset = copy.bufferOffset * texel_scale + offset;
     }
 
     image.Upload(image_copies, buffer, offset);

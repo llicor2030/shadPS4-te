@@ -110,13 +110,20 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
-                   const bool interruptible) {
+                   const bool interruptible, const bool high_resolution) {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
 
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+    HANDLE timer = NULL;
+    if (high_resolution) {
+        // CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+)
+        timer = ::CreateWaitableTimerExW(NULL, NULL, 0x00000001 | 0x00000002, TIMER_ALL_ACCESS);
+    }
+    if (timer == NULL) {
+        timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+    }
     SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
     const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
     ::CloseHandle(timer);
@@ -150,7 +157,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
-                   const bool interruptible) {
+                   const bool interruptible, [[maybe_unused]] const bool high_resolution) {
     timespec request = {
         .tv_sec = duration.count() / 1'000'000'000,
         .tv_nsec = duration.count() % 1'000'000'000,
@@ -238,7 +245,7 @@ AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
 void AccurateTimer::Start() {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
     if (total_wait.count() > 0) {
-        AccurateSleep(total_wait, nullptr, false);
+        AccurateSleep(total_wait, nullptr, false, high_resolution_sleep);
     }
     start_time = std::chrono::high_resolution_clock::now();
     total_wait -= std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);
@@ -248,6 +255,12 @@ void AccurateTimer::End() {
     auto now = std::chrono::high_resolution_clock::now();
     total_wait +=
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+    // Time lost while blocked (FIFO present, external frame limiters, stalls) is not paid back
+    // as a burst of back-to-back iterations: whole missed intervals are dropped and only the
+    // sub-interval remainder is kept, so the iteration phase stays on the original grid.
+    if (drop_missed_intervals && total_wait < -target_interval) {
+        total_wait %= target_interval;
+    }
 }
 
 std::string GetCurrentThreadName() {

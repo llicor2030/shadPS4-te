@@ -29,6 +29,7 @@
 #include <queue>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/audio/audio_rate_control.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/openal_manager.h"
@@ -54,6 +55,7 @@ constexpr u64 TIMING_RESYNC_THRESHOLD_US = 100000; // Resync if >100ms behind
 // OpenAL constants
 constexpr ALsizei NUM_BUFFERS = 6;
 constexpr ALsizei BUFFER_QUEUE_THRESHOLD = 2; // Queue more buffers when below this
+constexpr u32 OPENAL_UPDATE_FRAMES = 1024;
 
 // Channel positions
 enum ChannelPos : u8 {
@@ -133,6 +135,8 @@ public:
             }
         }
 
+        UpdatePlaybackRate(current_time);
+
         // Queue buffer
         if (!available_buffers.empty()) {
             ALuint buffer_id = available_buffers.back();
@@ -157,6 +161,9 @@ public:
         if (state != AL_PLAYING && queued > 0) {
             LOG_DEBUG(Lib_AudioOut, "Audio underrun detected (queued: {}), restarting source",
                       queued);
+            if (output_count > 0) {
+                rate_control.NoteUnderrun();
+            }
             alSourcePlay(source);
         }
 
@@ -243,6 +250,10 @@ private:
 
         // Calculate timing parameters
         period_us = (1000000ULL * buffer_frames + sample_rate / 2) / sample_rate;
+
+        // OpenAL Soft mixes in updates of about 1024 frames by default; the queue holds whole
+        // guest buffers from a fixed pool, so never aim below one of them.
+        rate_control.Configure(buffer_frames, OPENAL_UPDATE_FRAMES, sample_rate);
 
         // Check for AL_EXT_FLOAT32 extension
         has_float_ext = alIsExtensionPresent("AL_EXT_FLOAT32");
@@ -402,6 +413,26 @@ private:
             } else {
                 LOG_ERROR(Lib_AudioOut, "Failed to set audio gain: {}", GetALErrorString(error));
             }
+        }
+    }
+
+    // Playback pitch is trimmed by the queue level (see AudioRateControl). Must be called with
+    // this device's context current, after processed buffers were unqueued.
+    void UpdatePlaybackRate(u64 current_time) {
+        if (!rate_control.Enabled()) {
+            return;
+        }
+        ALint queued = 0;
+        ALint offset = 0;
+        alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
+        alGetSourcei(source, AL_SAMPLE_OFFSET, &offset);
+        const double queued_frames =
+            std::max(0.0, static_cast<double>(queued) * buffer_frames - offset);
+
+        const double ratio = rate_control.Update(queued_frames, current_time);
+        if (AudioRateControl::Differs(ratio, applied_ratio)) {
+            alSourcef(source, AL_PITCH, static_cast<ALfloat>(ratio));
+            applied_ratio = ratio;
         }
     }
 
@@ -1044,6 +1075,10 @@ private:
     u64 next_output_time{0};
     u64 last_volume_check_time{0};
     u32 output_count{0};
+
+    // Rate control
+    AudioRateControl rate_control;
+    double applied_ratio{1.0};
 
     // OpenAL objects
     OpenALDevice* device_context{nullptr};

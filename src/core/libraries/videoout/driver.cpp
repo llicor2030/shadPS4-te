@@ -9,7 +9,9 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
+#include "core/libraries/videoout/vsync_lock.h"
 #include "imgui/renderer/imgui_core.h"
+#include "sdl_window.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -345,6 +347,20 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::AccurateTimer timer{vblank_period};
 
+    // Keep the present phase locked to the host vblank (Mailbox/Immediate, Windows only).
+    const auto present_mode = EmulatorSettings.GetPresentMode();
+    const bool lock_allowed = present_mode == "Mailbox" || present_mode == "Immediate";
+    const auto get_native_window = []() -> void* {
+        if (!presenter) {
+            return nullptr;
+        }
+        const auto info = presenter->GetWindow().GetWindowInfo();
+        return info.type == Frontend::WindowSystemType::Windows ? info.render_surface : nullptr;
+    };
+    VsyncLock vsync_lock{vblank_period, lock_allowed, get_native_window};
+    timer.SetDropMissedIntervals(vsync_lock.DropMissedIntervals());
+    timer.SetHighResolutionSleep(vsync_lock.IsEnabled());
+
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
@@ -357,6 +373,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+        timer.SetTargetInterval(vsync_lock.NextInterval());
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

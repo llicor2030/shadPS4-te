@@ -372,6 +372,10 @@ struct AudioSettings {
     Setting<std::string> openal_padSpk_output_device{"Default Device"};
     Setting<u32> openal_hrtf{OpenALHrtfMode::HrtfAuto};
     Setting<u32> openal_output_mode{OpenALOutputMode::OutputAuto};
+    // Dynamic rate control of the output queue
+    Setting<bool> audio_drc{true};
+    Setting<u32> audio_drc_margin_ms{2};
+    Setting<bool> audio_drc_log{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -387,14 +391,19 @@ struct AudioSettings {
             make_override<AudioSettings>("openal_padSpk_output_device",
                                          &AudioSettings::openal_padSpk_output_device),
             make_override<AudioSettings>("openal_hrtf", &AudioSettings::openal_hrtf),
-            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode)};
+            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode),
+            make_override<AudioSettings>("audio_drc", &AudioSettings::audio_drc),
+            make_override<AudioSettings>("audio_drc_margin_ms",
+                                         &AudioSettings::audio_drc_margin_ms),
+            make_override<AudioSettings>("audio_drc_log", &AudioSettings::audio_drc_log)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
                                    sdl_main_output_device, sdl_padSpk_output_device,
                                    openal_mic_device, openal_main_output_device,
-                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode)
+                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode,
+                                   audio_drc, audio_drc_margin_ms, audio_drc_log)
 
 // Windows static guest red-zone protection
 struct WindowsGuestRedZoneProtectionSettings {
@@ -430,6 +439,11 @@ struct GPUSettings {
     Setting<bool> full_screen{false};
     Setting<std::string> full_screen_mode{"Windowed"};
     Setting<std::string> present_mode{"Mailbox"};
+    // Host vblank phase lock for Mailbox/Immediate (Windows)
+    Setting<bool> vsync_lock{true};
+    Setting<u32> vsync_lock_margin_ms{6};
+    Setting<bool> vsync_lock_log{false};
+    Setting<bool> vsync_drop_missed_vblanks{true};
     Setting<bool> hdr_allowed{false};
     Setting<bool> fsr_enabled{false};
     Setting<bool> rcas_enabled{true};
@@ -457,6 +471,11 @@ struct GPUSettings {
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
+            make_override<GPUSettings>("vsync_lock", &GPUSettings::vsync_lock),
+            make_override<GPUSettings>("vsync_lock_margin_ms", &GPUSettings::vsync_lock_margin_ms),
+            make_override<GPUSettings>("vsync_lock_log", &GPUSettings::vsync_lock_log),
+            make_override<GPUSettings>("vsync_drop_missed_vblanks",
+                                       &GPUSettings::vsync_drop_missed_vblanks),
         };
     }
 };
@@ -465,7 +484,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+                                   vsync_lock, vsync_lock_margin_ms, vsync_lock_log,
+                                   vsync_drop_missed_vblanks)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -707,6 +728,9 @@ public:
 
     // Audio settings
     SETTING_FORWARD(m_audio, AudioBackend, audio_backend)
+    SETTING_FORWARD_BOOL(m_audio, AudioDrcEnabled, audio_drc)
+    SETTING_FORWARD(m_audio, AudioDrcMarginMs, audio_drc_margin_ms)
+    SETTING_FORWARD_BOOL(m_audio, AudioDrcLogEnabled, audio_drc_log)
     SETTING_FORWARD(m_audio, SDLMicDevice, sdl_mic_device)
     SETTING_FORWARD(m_audio, SDLMainOutputDevice, sdl_main_output_device)
     SETTING_FORWARD(m_audio, SDLPadSpkOutputDevice, sdl_padSpk_output_device)
@@ -732,6 +756,10 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FullScreen, full_screen)
     SETTING_FORWARD(m_gpu, FullScreenMode, full_screen_mode)
     SETTING_FORWARD(m_gpu, PresentMode, present_mode)
+    SETTING_FORWARD_BOOL(m_gpu, VsyncLockEnabled, vsync_lock)
+    SETTING_FORWARD(m_gpu, VsyncLockMarginMs, vsync_lock_margin_ms)
+    SETTING_FORWARD_BOOL(m_gpu, VsyncLockLogEnabled, vsync_lock_log)
+    SETTING_FORWARD_BOOL(m_gpu, VsyncDropMissedVblanks, vsync_drop_missed_vblanks)
     SETTING_FORWARD(m_gpu, WindowHeight, window_height)
     SETTING_FORWARD(m_gpu, WindowWidth, window_width)
     SETTING_FORWARD(m_gpu, InternalScreenHeight, internal_screen_height)

@@ -203,6 +203,34 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
     port->output_cv.notify_all();
 }
 
+void ShutdownPorts() {
+    // quick_exit() runs the at_quick_exit handlers and ends the process: no destructor of a port
+    // or of its backend would run, so the audio device is torn down by the operating system while
+    // it is still playing. With WASAPI exclusive mode that is audible. Guest threads may still be
+    // running, so ports are only stopped, never freed.
+    for (u32 i = 0; i < ORBIS_AUDIO_OUT_NUM_PORTS; i++) {
+        std::shared_ptr<PortOut> port;
+        {
+            std::shared_lock read_lock{port_table_mutex};
+            port = port_table[i];
+        }
+        if (!port) {
+            continue;
+        }
+        {
+            // The output thread runs as a guest pthread and holds this mutex while it calls into
+            // the backend, so releasing the backend under the lock is enough: the thread leaves
+            // its loop on its own when it sees no backend. It must not be joined from here -
+            // joining is a guest pthread call and this is not a guest thread.
+            std::unique_lock port_lock{port->mutex};
+            port->closing = true;
+            port->output_ready = false;
+            port->impl.reset();
+        }
+        port->output_cv.notify_all();
+    }
+}
+
 /*
  * sceAudioOut implementation
  **/

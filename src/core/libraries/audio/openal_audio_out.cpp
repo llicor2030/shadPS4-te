@@ -29,6 +29,7 @@
 #include <queue>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/audio/audio_rate_control.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/openal_manager.h"
@@ -54,6 +55,7 @@ constexpr u64 TIMING_RESYNC_THRESHOLD_US = 100000; // Resync if >100ms behind
 // OpenAL constants
 constexpr ALsizei NUM_BUFFERS = 6;
 constexpr ALsizei BUFFER_QUEUE_THRESHOLD = 2; // Queue more buffers when below this
+constexpr u32 OPENAL_UPDATE_FRAMES = 1024;
 
 // Channel positions
 enum ChannelPos : u8 {
@@ -86,11 +88,14 @@ public:
     }
 
     ~OpenALPortBackend() override {
-        // Unregister port before cleanup
+        // Stop the source while its context is still alive. UnregisterPort drops the last port's
+        // context and closes the device, and after that Cleanup() can no longer make the context
+        // current: the source is still playing when the device goes away, which cuts the output
+        // mid-waveform. In WASAPI shared mode Windows hides it; in exclusive mode it is audible.
+        Cleanup();
         if (device_registered) {
             OpenALDevice::GetInstance().UnregisterPort(device_name);
         }
-        Cleanup();
     }
 
     void Output(void* ptr) override {
@@ -133,6 +138,8 @@ public:
             }
         }
 
+        UpdatePlaybackRate(current_time);
+
         // Queue buffer
         if (!available_buffers.empty()) {
             ALuint buffer_id = available_buffers.back();
@@ -157,6 +164,9 @@ public:
         if (state != AL_PLAYING && queued > 0) {
             LOG_DEBUG(Lib_AudioOut, "Audio underrun detected (queued: {}), restarting source",
                       queued);
+            if (output_count > 0) {
+                rate_control.NoteUnderrun();
+            }
             alSourcePlay(source);
         }
 
@@ -243,6 +253,28 @@ private:
 
         // Calculate timing parameters
         period_us = (1000000ULL * buffer_frames + sample_rate / 2) / sample_rate;
+
+        // The source queue is drained once per mixer update. Aim at the update size the device
+        // really runs with (openal_period_frames / alsoft.ini change it), converted to the
+        // source rate; fall back to OpenAL Soft's usual 1024 frames if it cannot be queried.
+        u32 update_frames = OPENAL_UPDATE_FRAMES;
+        if (ALCdevice* dev = alcGetContextsDevice(alcGetCurrentContext())) {
+            ALCint refresh = 0;
+            ALCint mixer_rate = 0;
+            alcGetIntegerv(dev, ALC_REFRESH, 1, &refresh);
+            alcGetIntegerv(dev, ALC_FREQUENCY, 1, &mixer_rate);
+            if (refresh > 0 && mixer_rate > 0) {
+                const u64 device_update = static_cast<u64>(mixer_rate) / refresh;
+                update_frames = static_cast<u32>(
+                    std::max<u64>(1, (device_update * sample_rate + mixer_rate / 2) / mixer_rate));
+            }
+        }
+        const u32 target_frames = rate_control.Configure(buffer_frames, update_frames, sample_rate);
+        if (rate_control.Enabled()) {
+            LOG_INFO(Lib_AudioOut,
+                     "Audio rate control: target {} frames ({:.1f} ms), device {} frames",
+                     target_frames, 1000.0 * target_frames / sample_rate, update_frames);
+        }
 
         // Check for AL_EXT_FLOAT32 extension
         has_float_ext = alIsExtensionPresent("AL_EXT_FLOAT32");
@@ -348,6 +380,10 @@ private:
         }
 
         if (source) {
+            // Mute first and give the mixer a couple of updates to hand the device silence, so
+            // the device buffer does not still hold audio when the device is closed.
+            alSourcef(source, AL_GAIN, 0.0f);
+            std::this_thread::sleep_for(std::chrono::microseconds(2 * period_us + 5000));
             alSourceStop(source);
 
             ALint queued = 0;
@@ -402,6 +438,26 @@ private:
             } else {
                 LOG_ERROR(Lib_AudioOut, "Failed to set audio gain: {}", GetALErrorString(error));
             }
+        }
+    }
+
+    // Playback pitch is trimmed by the queue level (see AudioRateControl). Must be called with
+    // this device's context current, after processed buffers were unqueued.
+    void UpdatePlaybackRate(u64 current_time) {
+        if (!rate_control.Enabled()) {
+            return;
+        }
+        ALint queued = 0;
+        ALint offset = 0;
+        alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
+        alGetSourcei(source, AL_SAMPLE_OFFSET, &offset);
+        const double queued_frames =
+            std::max(0.0, static_cast<double>(queued) * buffer_frames - offset);
+
+        const double ratio = rate_control.Update(queued_frames, current_time);
+        if (AudioRateControl::Differs(ratio, applied_ratio)) {
+            alSourcef(source, AL_PITCH, static_cast<ALfloat>(ratio));
+            applied_ratio = ratio;
         }
     }
 
@@ -1044,6 +1100,10 @@ private:
     u64 next_output_time{0};
     u64 last_volume_check_time{0};
     u32 output_count{0};
+
+    // Rate control
+    AudioRateControl rate_control;
+    double applied_ratio{1.0};
 
     // OpenAL objects
     OpenALDevice* device_context{nullptr};

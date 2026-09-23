@@ -81,7 +81,18 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+    // depth_stencil_format comes last so the existing indirect-draw call sites are unchanged.
+    const GraphicsPipeline* GetGraphicsPipeline(
+        const DrawIndirectParams params = {},
+        vk::Format depth_stencil_format = vk::Format::eUndefined);
+
+    // Re-selects only the depth-stencil attachment format of the pipeline already fetched for
+    // this draw. The two formats are chosen by different mechanisms -- the key asks which format
+    // carries the attachment feature, the image asks which one it could actually create -- so on
+    // a device that substitutes the guest depth format they disagree for every draw with a depth
+    // target. Refreshing the whole key again to change one field would then double the per-draw
+    // register read and stage refresh.
+    const GraphicsPipeline* GetGraphicsPipelineForDepthFormat(vk::Format depth_stencil_format);
 
     const ComputePipeline* GetComputePipeline();
 
@@ -101,7 +112,7 @@ public:
     }
 
 private:
-    bool RefreshGraphicsKey();
+    bool RefreshGraphicsKey(vk::Format depth_stencil_format);
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 

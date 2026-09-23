@@ -218,5 +218,10 @@ s32 PS4_SYSV_ABI sceAudioOutSparkControlSetEqCoef();
 s32 PS4_SYSV_ABI sceAudioOutSetSystemDebugState();
 
 void AdjustVol();
+
+/// Stops every open output port and releases its backend. Called on emulator shutdown, because
+/// the process leaves through quick_exit and no destructor would otherwise run.
+void ShutdownPorts();
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::AudioOut

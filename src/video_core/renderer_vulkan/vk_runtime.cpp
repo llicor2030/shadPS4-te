@@ -94,6 +94,39 @@ static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format
            width_in_blocks * block_size;
 }
 
+/// Format describing the buffer side of a buffer<->image copy of this image. Depth copies move
+/// the depth plane alone, in the texel size of the format the host image was created with: a D16
+/// image promoted to D24 or D32 is staged as 32-bit texels.
+static vk::Format BufferCopyFormat(const VideoCore::Image* image) {
+    if (!image->info.props.is_depth) {
+        return image->info.pixel_format;
+    }
+    switch (image->GetImageFormat()) {
+    case vk::Format::eD16Unorm:
+    case vk::Format::eD16UnormS8Uint:
+        return vk::Format::eD16Unorm;
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD32SfloatS8Uint:
+        return vk::Format::eD32Sfloat;
+    default:
+        return vk::Format::eX8D24UnormPack32;
+    }
+}
+
+/// A raw copy cannot convert between depth representations. Keep such overlap conversions out of
+/// the GPU queue instead of risking a device loss or corrupt depth values.
+static void ValidateCopyFormat(const VideoCore::Image* src, const VideoCore::Image* dst) {
+    if (!dst->info.props.is_depth && !src->info.props.is_depth) {
+        return;
+    }
+    const bool unchanged = dst->GetImageFormat() == dst->info.pixel_format &&
+                           src->GetImageFormat() == src->info.pixel_format;
+    ASSERT_MSG(unchanged || dst->GetImageFormat() == src->GetImageFormat(),
+               "Depth copy requires representation conversion: {} ({}) -> {} ({})",
+               vk::to_string(src->info.pixel_format), vk::to_string(src->GetImageFormat()),
+               vk::to_string(dst->info.pixel_format), vk::to_string(dst->GetImageFormat()));
+}
+
 Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_} {
     blit_helper = std::make_unique<VideoCore::BlitHelper>(instance, scheduler);
@@ -176,7 +209,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
                 vk::AccessFlagBits2::eTransferWrite);
     for (const auto& copy : upload_copies) {
-        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+        const auto copy_size = BufferImageCopySize(copy, BufferCopyFormat(dst));
         needs_flush |= IsBufferAccessed(src, copy.bufferOffset, copy_size);
     }
     if (needs_flush) {
@@ -188,7 +221,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                              upload_copies);
 
     for (const auto& copy : upload_copies) {
-        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+        const auto copy_size = BufferImageCopySize(copy, BufferCopyFormat(dst));
         AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
                      vk::AccessFlagBits2::eTransferRead);
     }
@@ -205,7 +238,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
                 vk::AccessFlagBits2::eTransferRead);
     for (const auto& copy : download_copies) {
-        const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
+        const auto copy_size = BufferImageCopySize(copy, BufferCopyFormat(src));
         needs_flush |= IsBufferAccessed(dst, copy.bufferOffset, copy_size, true);
     }
     if (needs_flush) {
@@ -217,13 +250,14 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                              download_copies);
 
     for (const auto& copy : download_copies) {
-        const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
+        const auto copy_size = BufferImageCopySize(copy, BufferCopyFormat(src));
         AccessBuffer(dst, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
                      vk::AccessFlagBits2::eTransferWrite);
     }
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    ValidateCopyFormat(src, dst);
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -323,6 +357,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
+    ValidateCopyFormat(src, dst);
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
     ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
@@ -343,7 +378,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         .imageOffset = {0, 0, 0},
         .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
     };
-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
+    const auto copy_size = BufferImageCopySize(buffer_copy, BufferCopyFormat(src));
 
     scheduler.EndRendering();
 
@@ -382,6 +417,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    ValidateCopyFormat(src, dst);
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -461,7 +497,7 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
 
         blit_helper->ReinterpretColorAsMsDepth(
             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
-            src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
+            src->GetImageFormat(), dst->GetImageFormat(), src->GetImage(), dst->GetImage());
     } else {
         LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
     }

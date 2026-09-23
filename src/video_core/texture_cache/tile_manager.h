@@ -6,6 +6,7 @@
 #include "common/types.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/texture_cache/depth_staging.h"
 
 namespace Vulkan {
 struct Runtime;
@@ -16,8 +17,14 @@ namespace VideoCore {
 struct ImageInfo;
 struct Image;
 
+TilingFormat GetTilingFormat(const ImageInfo& info, vk::Format host_format);
+u64 GuestToHostBytes(u64 guest_bytes, u32 guest_bytes_per_pixel, const TilingFormat& tiling_format);
+
 class TileManager {
-    static constexpr size_t NUM_BPPS = 5;
+    static constexpr size_t NUM_BPPS = 6;
+    static constexpr size_t NUM_SAMPLE_COUNTS = 4;
+    static constexpr size_t NUM_DEPTH_CONVERSIONS = 3;
+    static constexpr size_t NUM_PIPELINE_LAYOUTS = 2;
 
 public:
     explicit TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -28,10 +35,11 @@ public:
                    const VideoCore::Buffer* out_buffer, u64 out_offset);
 
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
-                                              const ImageInfo& info);
+                                              const ImageInfo& info, vk::Format host_format);
 
 private:
-    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);
+    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler,
+                                   DepthConversion depth_conversion, bool is_linear);
 
 private:
     const Vulkan::Instance& instance;
@@ -40,8 +48,12 @@ private:
     StreamBuffer& stream_buffer;
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
-    std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS> detilers{};
-    std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS> tilers{};
+    std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS * NUM_SAMPLE_COUNTS *
+                                       NUM_DEPTH_CONVERSIONS * NUM_PIPELINE_LAYOUTS>
+        detilers{};
+    std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS * NUM_SAMPLE_COUNTS *
+                                       NUM_DEPTH_CONVERSIONS * NUM_PIPELINE_LAYOUTS>
+        tilers{};
 };
 
 } // namespace VideoCore

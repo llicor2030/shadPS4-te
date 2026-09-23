@@ -530,6 +530,8 @@ set(VIDEOOUT_LIB src/core/libraries/videoout/buffer.h
                  src/core/libraries/videoout/video_out.cpp
                  src/core/libraries/videoout/video_out.h
                  src/core/libraries/videoout/videoout_error.h
+                 src/core/libraries/videoout/vsync_lock.cpp
+                 src/core/libraries/videoout/vsync_lock.h
 )
 
 set(HLE_LIBC_INTERNAL_LIB src/core/libraries/libc_internal/libc_internal.cpp

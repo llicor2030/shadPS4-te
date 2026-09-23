@@ -4,6 +4,7 @@
 #include <ranges>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_image_format.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -99,7 +100,12 @@ void UniqueImage::Destroy() {
 }
 
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
-    this->image_ci = image_ci;
+    const auto result = TryCreate(image_ci);
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed allocating image with error {}",
+               vk::to_string(result));
+}
+
+vk::Result UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci) {
     ASSERT(!image);
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
@@ -113,12 +119,16 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
-                                     &allocation, &alloc_info);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
-               vk::to_string(vk::Result{result}));
-    image = vk::Image{unsafe_image};
-    size_bytes = alloc_info.size;
+    VmaAllocation new_allocation{};
+    const VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                           &new_allocation, &alloc_info);
+    if (result == VK_SUCCESS) {
+        this->image_ci = image_ci;
+        image = vk::Image{unsafe_image};
+        allocation = new_allocation;
+        size_bytes = alloc_info.size;
+    }
+    return vk::Result{result};
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
@@ -152,29 +162,10 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
-    const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
-    const vk::PhysicalDeviceImageFormatInfo2 format_info{
-        .format = supported_format,
-        .type = ConvertImageType(info.type),
-        .tiling = tiling,
-        .usage = usage_flags,
-        .flags = flags,
-    };
-    const auto image_format_properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
-    }
-    supported_samples = image_format_properties.result == vk::Result::eSuccess
-                            ? image_format_properties.value.imageFormatProperties.sampleCounts
-                            : vk::SampleCountFlagBits::e1;
-
-    const vk::ImageCreateInfo image_ci = {
+    vk::ImageCreateInfo image_ci = {
         .flags = flags,
         .imageType = ConvertImageType(info.type),
-        .format = supported_format,
+        .format = info.pixel_format,
         .extent{
             .width = info.size.width,
             .height = info.size.height,
@@ -182,7 +173,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         },
         .mipLevels = static_cast<u32>(info.resources.levels),
         .arrayLayers = static_cast<u32>(info.resources.layers),
-        .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
+        .samples = static_cast<vk::SampleCountFlagBits>(info.num_samples),
         .tiling = tiling,
         .usage = usage_flags,
         .initialLayout = vk::ImageLayout::eUndefined,
@@ -191,7 +182,42 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(image_ci);
+    const auto query_support = [&instance](const vk::ImageCreateInfo& candidate) {
+        return instance.GetImageFormatSupport({.format = candidate.format,
+                                               .type = candidate.imageType,
+                                               .tiling = candidate.tiling,
+                                               .usage = candidate.usage,
+                                               .flags = candidate.flags});
+    };
+    if (info.props.is_depth) {
+        // The attachment feature alone does not say whether an image of this size, sample count
+        // and usage can be created, so each candidate is actually created before it is taken.
+        const auto selected = TryCreateDepthImage(image_ci, query_support,
+                                                  [this](const vk::ImageCreateInfo& candidate) {
+                                                      return backing->image.TryCreate(candidate);
+                                                  });
+        ASSERT_MSG(selected.result == vk::Result::eSuccess,
+                   "No usable depth image for {} {}x{}x{} levels={} layers={} samples={}: {}",
+                   vk::to_string(info.pixel_format), info.size.width, info.size.height,
+                   info.size.depth, info.resources.levels, info.resources.layers, info.num_samples,
+                   vk::to_string(selected.result));
+        supported_samples = selected.supported_samples;
+        LOG_DEBUG(Render_Vulkan, "Depth image format {} -> {}", vk::to_string(info.pixel_format),
+                  vk::to_string(selected.format));
+    } else {
+        image_ci.format = instance.GetSupportedFormat(info.pixel_format, format_features);
+        const auto support = query_support(image_ci);
+        if (support.result == vk::Result::eErrorFormatNotSupported) {
+            LOG_ERROR(Render_Vulkan,
+                      "image format {} type {} is not supported (flags {}, usage {})",
+                      vk::to_string(image_ci.format), vk::to_string(image_ci.imageType),
+                      vk::to_string(image_ci.flags), vk::to_string(image_ci.usage));
+        }
+        supported_samples = support.result == vk::Result::eSuccess ? support.properties.sampleCounts
+                                                                   : vk::SampleCountFlagBits::e1;
+        image_ci.samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples);
+        backing->image.Create(image_ci);
+    }
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,

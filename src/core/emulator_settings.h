@@ -295,14 +295,18 @@ struct DebugSettings {
     Setting<bool> debug_dump{false};         // specific
     Setting<bool> shader_collect{false};     // specific
     Setting<std::string> config_version{""}; // specific
+    // Log texture cache decisions (a bounded number per image) to track down stale textures
+    Setting<bool> texture_trace{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
             make_override<DebugSettings>("debug_dump", &DebugSettings::debug_dump),
-            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect)};
+            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect),
+            make_override<DebugSettings>("texture_trace", &DebugSettings::texture_trace)};
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version,
+                                   texture_trace)
 
 // -------------------------------
 // Input settings
@@ -727,6 +731,7 @@ public:
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)
     SETTING_FORWARD_BOOL(m_debug, ShaderCollect, shader_collect)
     SETTING_FORWARD(m_debug, ConfigVersion, config_version)
+    SETTING_FORWARD_BOOL(m_debug, TextureTrace, texture_trace)
 
     // GPU Settings
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)

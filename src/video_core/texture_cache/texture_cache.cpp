@@ -176,21 +176,33 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
+            if (texture_trace) {
+                TraceImage(image, "cpu write", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
             // We should not mark it as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
             // Remove tracking from this page only.
             UntrackImageHead(image_id);
+            if (texture_trace) {
+                TraceImage(image, "untrack head", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         } else if (image_begin < pages_start) {
             // This page access does not modify the image but the page should be untracked.
             // We should not mark this image as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
             UntrackImageTail(image_id);
+            if (texture_trace) {
+                TraceImage(image, "untrack tail", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         } else {
             // Image begins and ends on this page so it can not receive any more invalidations.
             // We will check it's hash later to see if it really was modified.
             MarkAsMaybeDirty(image_id, image);
+            if (texture_trace) {
+                TraceImage(image, "maybe dirty", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         }
     });
 }
@@ -204,6 +216,9 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
+        if (texture_trace) {
+            TraceImage(image, "gpu write", fmt::format(" at {:#x}+{:#x}", address, max_size));
+        }
         image.flags |= ImageFlagBits::GpuDirty;
     });
 }
@@ -213,6 +228,10 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    if (texture_trace && !deleted_images.empty()) {
+        LOG_INFO(Render_Vulkan, "TexTrace t={} unmap {:#x}+{:#x} frees {} image(s)",
+                 scheduler.CurrentTick(), cpu_addr, size, deleted_images.size());
+    }
     for (const ImageId id : deleted_images) {
         // TODO: Download image data back to host.
         FreeImage(id);
@@ -513,6 +532,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     if (!image_id) {
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
+        if (texture_trace) {
+            TraceImage(slot_images[image_id], "new");
+        }
+    } else if (texture_trace) {
+        const auto& found = slot_images[image_id].info;
+        if (found.guest_address != info.guest_address || found.pixel_format != info.pixel_format ||
+            found.tile_mode != info.tile_mode || found.guest_size != info.guest_size) {
+            TraceImage(slot_images[image_id], "reused for",
+                       fmt::format(" {:#x}+{:#x} {}x{} {} tile {}", info.guest_address,
+                                   info.guest_size, info.size.width, info.size.height,
+                                   vk::to_string(info.pixel_format), u32(info.tile_mode)));
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -571,6 +602,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    if (texture_trace) {
+        TraceUse(image, desc.view_info, "texture");
+    }
     return image.FindView(desc.view_info);
 }
 
@@ -583,6 +617,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
+    if (texture_trace) {
+        TraceUse(image, desc.view_info, "render target");
+    }
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
@@ -642,6 +679,13 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
+    }
+    if (texture_trace) {
+        // Hash of what guest memory holds now; no upload line after this means the refresh
+        // was skipped because the contents looked unchanged.
+        const auto* mem = std::bit_cast<const u8*>(image.info.guest_address);
+        TraceImage(image, "refresh",
+                   fmt::format(" mem={:016x}", XXH3_64bits(mem, image.info.guest_size)));
     }
 
     RENDERER_TRACE;
@@ -714,8 +758,16 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     if (image_copies.empty()) {
+        if (texture_trace) {
+            TraceImage(image, "refresh skipped (gpu contents kept)");
+        }
         image.flags &= ~ImageFlagBits::Dirty;
         return;
+    }
+    if (texture_trace) {
+        TraceImage(image, "upload",
+                   fmt::format(" {} mip(s) from {}", image_copies.size(),
+                               True(image.flags & ImageFlagBits::GpuDirty) ? "gpu" : "memory"));
     }
 
     scheduler.EndRendering();
@@ -1042,6 +1094,56 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
         slot_images.erase(image_id);
     });
+}
+
+bool TextureCache::IsTextureTraceEnabled() {
+    return EmulatorSettings.IsTextureTrace();
+}
+
+void TextureCache::TraceImage(const Image& image, std::string_view event, std::string_view detail) {
+    // Enough lines per image to follow a few update cycles; images refreshed every frame stop
+    // logging after that instead of flooding the log.
+    static constexpr u32 MaxLinesPerImage = 48;
+    std::scoped_lock lk{trace_mutex};
+    auto& state = trace_states[image.image_uid];
+    if (state.lines >= MaxLinesPerImage) {
+        return;
+    }
+    ++state.lines;
+    const auto& info = image.info;
+    LOG_INFO(Render_Vulkan,
+             "TexTrace t={} {} uid={} {:#x}+{:#x} {}x{}x{} {} tile {} mips {} layers {} "
+             "flags {:#x}{}{}",
+             scheduler.CurrentTick(), event, image.image_uid, info.guest_address, info.guest_size,
+             info.size.width, info.size.height, info.size.depth, vk::to_string(info.pixel_format),
+             u32(info.tile_mode), info.resources.levels, info.resources.layers, u32(image.flags),
+             detail,
+             state.lines == MaxLinesPerImage ? " (further lines for this image dropped)" : "");
+}
+
+void TextureCache::TraceUse(const Image& image, const ImageViewInfo& view, std::string_view kind) {
+    // Logged when an image is first used, and again whenever it is used through a different
+    // view (format, swizzle or subresource range).
+    const u32 fields[] = {u32(view.type),           u32(view.format),         u32(view.mapping.r),
+                          u32(view.mapping.g),      u32(view.mapping.b),      u32(view.mapping.a),
+                          view.range.base.level,    view.range.extent.levels, view.range.base.layer,
+                          view.range.extent.layers, u32(view.is_storage)};
+    const u64 key = XXH3_64bits(fields, sizeof(fields));
+    {
+        std::scoped_lock lk{trace_mutex};
+        auto& state = trace_states[image.image_uid];
+        if (state.last_use == key) {
+            return;
+        }
+        state.last_use = key;
+    }
+    TraceImage(image, "used as",
+               fmt::format(" {} view {} swizzle {},{},{},{} mips {}+{} layers {}+{}", kind,
+                           vk::to_string(view.format), vk::to_string(view.mapping.r),
+                           vk::to_string(view.mapping.g), vk::to_string(view.mapping.b),
+                           vk::to_string(view.mapping.a), view.range.base.level,
+                           view.range.extent.levels, view.range.base.layer,
+                           view.range.extent.layers));
 }
 
 } // namespace VideoCore

@@ -319,6 +319,9 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+        if (texture_trace) {
+            TraceImage(slot_images[image_id], "free");
+        }
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -326,6 +329,11 @@ private:
 
     void GarbageCollectImages();
     void GarbageCollectSamplers();
+
+    /// Texture trace (Debug.texture_trace): logs cache decisions, a bounded number per image.
+    static bool IsTextureTraceEnabled();
+    void TraceImage(const Image& image, std::string_view event, std::string_view detail = {});
+    void TraceUse(const Image& image, const ImageViewInfo& view, std::string_view kind);
 
 private:
     const Vulkan::Instance& instance;
@@ -361,6 +369,13 @@ private:
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    struct TraceState {
+        u32 lines = 0;
+        u64 last_use = 0;
+    };
+    const bool texture_trace = IsTextureTraceEnabled();
+    std::mutex trace_mutex;
+    tsl::robin_map<u64, TraceState> trace_states;
 };
 
 } // namespace VideoCore

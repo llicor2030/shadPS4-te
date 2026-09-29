@@ -36,6 +36,7 @@
 #include "core/file_format/psf.h"
 #include "core/file_format/trp.h"
 #include "core/file_sys/fs.h"
+#include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/openal_config.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
@@ -91,6 +92,8 @@ void Emulator::Shutdown() {
         return;
     }
     Common::Log::Flush();
+    // Stop audio before the process ends, so the device is not torn down mid-playback.
+    Libraries::AudioOut::ShutdownPorts();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();
     play_time_thread.request_stop();

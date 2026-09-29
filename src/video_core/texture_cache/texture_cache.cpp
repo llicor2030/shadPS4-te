@@ -639,25 +639,29 @@ void TextureCache::RefreshImage(Image& image) {
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
+    // An image only becomes MaybeCpuDirty when every page it touches was unprotected by a write
+    // next to it, so it spans at most two tracker pages. Once those pages are unprotected the image
+    // itself can be rewritten without any fault, and the hash is the only thing that notices.
+    // It has to cover the whole image: a new sprite placed where an old one lived usually shares
+    // the old one's transparent top-left corner, so a partial hash keeps the stale contents.
+    const auto addr = std::bit_cast<const u8*>(image.info.guest_address);
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
-        False(image.flags & ImageFlagBits::CpuDirty)) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
-        const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
+        False(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::GpuDirty))) {
+        const u64 hash = XXH3_64bits(addr, image.info.guest_size);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
         }
-        image.hash = hash;
     }
+    // Remember what guest memory held when these contents were taken, so a later
+    // MaybeCpuDirty check compares against the uploaded data and not an older version.
+    // GPU-dirty contents come from the buffer cache, not guest memory: hash lazily instead.
+    // Page watchers work in PageManager pages: two of them bound what can be MaybeCpuDirty.
+    constexpr u64 MaybeDirtyMaxSize = 2 * PageManager::GetNextPageAddr(0);
+    image.hash =
+        image.info.guest_size <= MaybeDirtyMaxSize && False(image.flags & ImageFlagBits::GpuDirty)
+            ? XXH3_64bits(addr, image.info.guest_size)
+            : 0;
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;

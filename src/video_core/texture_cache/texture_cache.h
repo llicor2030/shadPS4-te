@@ -5,6 +5,8 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <span>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
@@ -20,6 +22,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/texture_cache/trace_window.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -110,6 +113,22 @@ public:
 
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+
+    /// Texture trace: one image a draw reads (texture) or renders to (render target).
+    struct TraceBinding {
+        ImageId image_id;
+        ImageViewInfo view;
+        std::string_view kind;
+        u32 slot;
+    };
+
+    /// True while texture trace is on and a trace window is open.
+    [[nodiscard]] bool TraceOpen() const {
+        return texture_trace && TraceWindow::Current() != 0;
+    }
+
+    /// Logs the images a draw used, once per distinct draw and window.
+    void TraceDraw(u64 pipeline_hash, std::span<const TraceBinding> bindings);
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
@@ -319,6 +338,9 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+        if (TraceOpen()) {
+            TraceImage(slot_images[image_id], "free");
+        }
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -326,6 +348,14 @@ private:
 
     void GarbageCollectImages();
     void GarbageCollectSamplers();
+
+    /// Texture trace (Debug.texture_trace): logs cache decisions and what each draw reads while a
+    /// trace window is open (see trace_window.h).
+    static bool IsTextureTraceEnabled();
+    void TraceImage(const Image& image, std::string_view event, std::string_view detail = {});
+    void SetTraceContent(const Image& image, std::string content);
+    void MarkTraceRendered(const Image& image);
+    void TraceCopy(const Image& dst, const Image& src, std::string_view what);
 
 private:
     const Vulkan::Instance& instance;
@@ -361,6 +391,15 @@ private:
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    struct TraceState {
+        std::string content;   // what the image was last filled with (hash and source)
+        bool rendered = false; // written by the GPU since then
+    };
+    const bool texture_trace = IsTextureTraceEnabled();
+    std::mutex trace_mutex;
+    tsl::robin_map<u64, TraceState> trace_states;
+    std::unordered_set<u64> trace_draws_seen;
+    u32 trace_draw_window = 0;
 };
 
 } // namespace VideoCore

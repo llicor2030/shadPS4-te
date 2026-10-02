@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "common/hash.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -419,6 +420,25 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_infos.clear();
     image_infos.clear();
 
+    trace_bindings.clear();
+    trace_draw = texture_cache.TraceOpen();
+    if (trace_draw) {
+        // Identifies the draw across trace windows: its shaders and, for graphics, the full
+        // pipeline state (blending, write masks, formats).
+        u64 hash = 0;
+        for (const auto* info : pipeline->GetStages()) {
+            if (info) {
+                hash = HashCombine(hash, info->pgm_hash);
+            }
+        }
+        if (!pipeline->IsCompute()) {
+            hash = HashCombine(
+                hash, std::hash<GraphicsPipelineKey>{}(
+                          static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey()));
+        }
+        trace_pipeline_hash = hash;
+    }
+
     bool uses_dma = false;
 
     // Bind resource buffers and textures.
@@ -561,6 +581,11 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
+    if (trace_draw) {
+        texture_cache.TraceDraw(trace_pipeline_hash, trace_bindings);
+        trace_bindings.clear();
+        trace_draw = false;
+    }
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
@@ -884,7 +909,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     // Second pass to re-bind images that were updated after binding
+    u32 trace_slot = 0;
     for (auto& [image_id, desc] : image_bindings) {
+        const u32 slot = trace_slot++;
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
@@ -899,6 +926,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
+            if (trace_draw) {
+                trace_bindings.push_back(
+                    {image_id, desc.view_info, magic_enum::enum_name(stage.hw_stage), slot});
+            }
             const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render
@@ -995,6 +1026,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         texture_cache.UpdateImage(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        if (trace_draw) {
+            trace_bindings.push_back({image_id, desc.view_info, "rt", cb});
+        }
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 

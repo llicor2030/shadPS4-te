@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -23,6 +29,29 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+static void ConvertDepthDownloadToGuest(u8* data, const u64 num_texels,
+                                        const DepthConversion conversion) {
+    if (conversion == DepthConversion::None) {
+        return;
+    }
+
+    for (u64 texel = 0; texel < num_texels; ++texel) {
+        u32 host_value;
+        std::memcpy(&host_value, data + texel * sizeof(host_value), sizeof(host_value));
+
+        u16 guest_value;
+        if (conversion == DepthConversion::D16ToD24) {
+            guest_value = D24ToD16(host_value);
+        } else {
+            const float depth = std::bit_cast<float>(host_value);
+            const float clamped_depth = std::isnan(depth) ? 0.0f : std::clamp(depth, 0.0f, 1.0f);
+            guest_value = static_cast<u16>(
+                std::lround(clamped_depth * static_cast<float>(std::numeric_limits<u16>::max())));
+        }
+        std::memcpy(data + texel * sizeof(guest_value), &guest_value, sizeof(guest_value));
+    }
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -75,11 +104,22 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
-    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
-                              image.info.resources.layers * (image.info.num_bits / 8);
+    const u32 guest_bytes_per_pixel = image.info.num_bits / 8;
+    const u64 num_texels = u64{image.info.pitch} * image.info.size.height * image.info.size.depth *
+                           image.info.resources.layers;
+    const u64 download_size = num_texels * guest_bytes_per_pixel;
     ASSERT(download_size <= image.info.guest_size);
+    ASSERT_MSG(image.info.num_samples == 1,
+               "Image readback requires a single-sample source, got {} samples",
+               image.info.num_samples);
+    // A promoted depth image (D16 held as D24/D32) is read back in its host texel size and
+    // narrowed in place before it reaches guest memory.
+    const auto tiling_format = GetTilingFormat(image.info, image.GetImageFormat());
+    const u64 host_download_size =
+        GuestToHostBytes(download_size, guest_bytes_per_pixel, tiling_format);
+    const auto depth_conversion = tiling_format.depth_conversion;
     const auto download =
-        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
+        runtime.GetStagingPool().Request(host_download_size, MemoryType::HostCached, 16, !sync);
     const vk::BufferImageCopy image_download = {
         .bufferOffset = download.offset,
         .bufferRowLength = image.info.pitch,
@@ -99,16 +139,18 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
+        ConvertDepthDownloadToGuest(download.mapped, num_texels, depth_conversion);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
     } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                download.Invalidate();
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                                                          download.mapped, download_size);
-                runtime.GetStagingPool().FreeDeferred(download);
-            });
+        scheduler.DeferPriorityOperation([this, device_addr = image.info.guest_address, download,
+                                          download_size, num_texels, depth_conversion] {
+            download.Invalidate();
+            ConvertDepthDownloadToGuest(download.mapped, num_texels, depth_conversion);
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                      download.mapped, download_size);
+            runtime.GetStagingPool().FreeDeferred(download);
+        });
     }
 }
 
@@ -621,6 +663,8 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
+    const auto tiling_format = GetTilingFormat(image.info, image.GetImageFormat());
+    const u32 guest_bytes_per_pixel = image.info.num_bits / 8;
 
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
@@ -643,7 +687,7 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
         image_copies.push_back({
-            .bufferOffset = mip_offset,
+            .bufferOffset = GuestToHostBytes(mip_offset, guest_bytes_per_pixel, tiling_format),
             .bufferRowLength = mip_pitch,
             .bufferImageHeight = mip_height,
             .imageSubresource{
@@ -666,7 +710,8 @@ void TextureCache::RefreshImage(Image& image) {
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    const auto [buffer, offset] =
+        tile_manager.DetileImage(in_buffer, in_offset, image.info, image.GetImageFormat());
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }

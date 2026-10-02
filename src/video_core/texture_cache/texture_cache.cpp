@@ -176,21 +176,33 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
+            if (TraceOpen()) {
+                TraceImage(image, "cpu write", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
             // We should not mark it as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
             // Remove tracking from this page only.
             UntrackImageHead(image_id);
+            if (TraceOpen()) {
+                TraceImage(image, "untrack head", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         } else if (image_begin < pages_start) {
             // This page access does not modify the image but the page should be untracked.
             // We should not mark this image as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
             UntrackImageTail(image_id);
+            if (TraceOpen()) {
+                TraceImage(image, "untrack tail", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         } else {
             // Image begins and ends on this page so it can not receive any more invalidations.
             // We will check it's hash later to see if it really was modified.
             MarkAsMaybeDirty(image_id, image);
+            if (TraceOpen()) {
+                TraceImage(image, "maybe dirty", fmt::format(" at {:#x}+{:#x}", addr, size));
+            }
         }
     });
 }
@@ -204,6 +216,9 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
+        if (TraceOpen()) {
+            TraceImage(image, "gpu write", fmt::format(" at {:#x}+{:#x}", address, max_size));
+        }
         image.flags |= ImageFlagBits::GpuDirty;
     });
 }
@@ -213,6 +228,10 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    if (TraceOpen() && !deleted_images.empty()) {
+        LOG_INFO(Render_Vulkan, "TexTrace t={} unmap {:#x}+{:#x} frees {} image(s)",
+                 scheduler.CurrentTick(), cpu_addr, size, deleted_images.size());
+    }
     for (const ImageId id : deleted_images) {
         // TODO: Download image data back to host.
         FreeImage(id);
@@ -278,6 +297,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // When creating a depth buffer through overlap resolution don't clear it on first use.
         new_image.info.meta_info.htile_clear_mask = 0;
         runtime.CopyColorAndDepth(&cache_image, &new_image);
+        if (texture_trace) {
+            TraceCopy(new_image, cache_image, "copy (depth overlap)");
+        }
 
         // Free the cache image.
         FreeImage(cache_image_id);
@@ -409,6 +431,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 if (merged_image_id) {
                     auto& merged_image = slot_images[merged_image_id];
                     runtime.CopyMip(&cache_image, &merged_image, mip, slice);
+                    if (texture_trace) {
+                        TraceCopy(merged_image, cache_image,
+                                  fmt::format("copy into mip {} layer {}", mip, slice));
+                    }
                     FreeImage(cache_image_id);
                 }
             }
@@ -434,12 +460,21 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     if (True(src_image.flags & ImageFlagBits::GpuModified) &&
         False(src_image.flags & ImageFlagBits::Dirty)) {
         runtime.CopyImage(&src_image, &new_image);
+        if (texture_trace) {
+            TraceCopy(new_image, src_image, "copy (expand)");
+        }
     }
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
     }
 
+    if (TraceOpen()) {
+        TraceImage(new_image, "expanded",
+                   fmt::format(" from uid={} {:#x}+{:#x} mips {} flags {:#x}", src_image.image_uid,
+                               src_image.info.guest_address, src_image.info.guest_size,
+                               src_image.info.resources.levels, u32(src_image.flags)));
+    }
     FreeImage(image_id);
     TrackImage(new_image_id);
     return new_image_id;
@@ -513,6 +548,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     if (!image_id) {
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
+        if (TraceOpen()) {
+            TraceImage(slot_images[image_id], "new");
+        }
+    } else if (TraceOpen()) {
+        const auto& found = slot_images[image_id].info;
+        if (found.guest_address != info.guest_address || found.pixel_format != info.pixel_format ||
+            found.tile_mode != info.tile_mode || found.guest_size != info.guest_size) {
+            TraceImage(slot_images[image_id], "reused for",
+                       fmt::format(" {:#x}+{:#x} {}x{} {} tile {}", info.guest_address,
+                                   info.guest_size, info.size.width, info.size.height,
+                                   vk::to_string(info.pixel_format), u32(info.tile_mode)));
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -571,6 +618,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    if (texture_trace && desc.type == BindingType::Storage) {
+        MarkTraceRendered(image);
+    }
     return image.FindView(desc.view_info);
 }
 
@@ -583,6 +633,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
+    if (texture_trace) {
+        MarkTraceRendered(image);
+    }
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
@@ -605,6 +658,9 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
+    if (texture_trace) {
+        MarkTraceRendered(image);
+    }
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
@@ -642,6 +698,15 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
+    }
+    // Texture trace: hash of what guest memory holds now. No upload line after the refresh line
+    // means the refresh was skipped because the contents looked unchanged.
+    const u64 trace_mem_hash =
+        texture_trace
+            ? XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size)
+            : 0;
+    if (TraceOpen()) {
+        TraceImage(image, "refresh", fmt::format(" mem={:016x}", trace_mem_hash));
     }
 
     RENDERER_TRACE;
@@ -710,8 +775,27 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     if (image_copies.empty()) {
+        if (TraceOpen()) {
+            TraceImage(image, "refresh skipped (gpu contents kept)");
+        }
         image.flags &= ~ImageFlagBits::Dirty;
         return;
+    }
+    if (texture_trace) {
+        // Record what the image now holds. ObtainBufferForImage below takes the data from the
+        // buffer cache instead of guest memory when any part of the range was written by the GPU,
+        // and then the memory hash does not describe the uploaded data.
+        const bool from_gpu_buffer =
+            buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size);
+        std::string content = fmt::format("{:016x} from {}", trace_mem_hash,
+                                          from_gpu_buffer ? "gpu-buffer" : "memory");
+        if (image_copies.size() < num_mips) {
+            content += fmt::format(" mips {}/{}", image_copies.size(), num_mips);
+        }
+        if (TraceOpen()) {
+            TraceImage(image, "upload", " content " + content);
+        }
+        SetTraceContent(image, std::move(content));
     }
 
     scheduler.EndRendering();
@@ -1038,6 +1122,102 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
         slot_images.erase(image_id);
     });
+}
+
+bool TextureCache::IsTextureTraceEnabled() {
+    const bool enabled = EmulatorSettings.IsTextureTrace();
+    if (enabled) {
+        TraceWindow::Configure(EmulatorSettings.GetTextureTraceTrigger(),
+                               EmulatorSettings.GetTextureTraceSeconds());
+    }
+    return enabled;
+}
+
+void TextureCache::TraceImage(const Image& image, std::string_view event, std::string_view detail) {
+    // Every event while a window is open, with no per-image limit, so that each window holds the
+    // complete story of the textures it uses and windows can be compared with each other.
+    const auto& info = image.info;
+    LOG_INFO(Render_Vulkan,
+             "TexTrace t={} {} uid={} {:#x}+{:#x} {}x{}x{} {} tile {} mips {} layers {} "
+             "flags {:#x}{} w={}",
+             scheduler.CurrentTick(), event, image.image_uid, info.guest_address, info.guest_size,
+             info.size.width, info.size.height, info.size.depth, vk::to_string(info.pixel_format),
+             u32(info.tile_mode), info.resources.levels, info.resources.layers, u32(image.flags),
+             detail, TraceWindow::Current());
+}
+
+void TextureCache::SetTraceContent(const Image& image, std::string content) {
+    std::scoped_lock lk{trace_mutex};
+    auto& state = trace_states[image.image_uid];
+    state.content = std::move(content);
+    state.rendered = false;
+}
+
+void TextureCache::MarkTraceRendered(const Image& image) {
+    std::scoped_lock lk{trace_mutex};
+    trace_states[image.image_uid].rendered = true;
+}
+
+void TextureCache::TraceCopy(const Image& dst, const Image& src, std::string_view what) {
+    std::string content;
+    {
+        std::scoped_lock lk{trace_mutex};
+        const auto& src_state = trace_states[src.image_uid];
+        auto& dst_state = trace_states[dst.image_uid];
+        dst_state.content += fmt::format(" + {} of uid {} ({}{})", what, src.image_uid,
+                                         src_state.content.empty() ? "none" : src_state.content,
+                                         src_state.rendered ? ", rendered" : "");
+        dst_state.rendered |= src_state.rendered;
+        content = dst_state.content;
+    }
+    if (TraceOpen()) {
+        TraceImage(dst, what,
+                   fmt::format(" from uid={} {:#x}+{:#x} flags {:#x} content {}", src.image_uid,
+                               src.info.guest_address, src.info.guest_size, u32(src.flags),
+                               content));
+    }
+}
+
+void TextureCache::TraceDraw(u64 pipeline_hash, std::span<const TraceBinding> bindings) {
+    const u32 window = TraceWindow::Current();
+    if (!texture_trace || window == 0 || bindings.empty()) {
+        return;
+    }
+    // One line per distinct draw (pipeline plus every image it reads or renders to, with the
+    // contents each image holds) per window. The same draw is listed again in the next window, so
+    // windows can be compared directly.
+    std::string line;
+    {
+        std::scoped_lock lk{trace_mutex};
+        for (const auto& binding : bindings) {
+            const Image& image = slot_images[binding.image_id];
+            const auto& info = image.info;
+            const auto& view = binding.view;
+            const auto& state = trace_states[image.image_uid];
+            fmt::format_to(std::back_inserter(line),
+                           " | {}{} uid={} {:#x}+{:#x} {}x{} {} mips {} view {} {},{},{},{} mips "
+                           "{}+{} content {}{}",
+                           binding.kind, binding.slot, image.image_uid, info.guest_address,
+                           info.guest_size, info.size.width, info.size.height,
+                           vk::to_string(info.pixel_format), info.resources.levels,
+                           vk::to_string(view.format), vk::to_string(view.mapping.r),
+                           vk::to_string(view.mapping.g), vk::to_string(view.mapping.b),
+                           vk::to_string(view.mapping.a), view.range.base.level,
+                           view.range.extent.levels,
+                           state.content.empty() ? "none" : state.content,
+                           state.rendered ? " rendered" : "");
+        }
+        if (trace_draw_window != window) {
+            trace_draw_window = window;
+            trace_draws_seen.clear();
+        }
+        const u64 key = HashCombine(pipeline_hash, XXH3_64bits(line.data(), line.size()));
+        if (!trace_draws_seen.insert(key).second) {
+            return;
+        }
+    }
+    LOG_INFO(Render_Vulkan, "TexTrace t={} draw w={} pl={:016x}{}", scheduler.CurrentTick(),
+             window, pipeline_hash, line);
 }
 
 } // namespace VideoCore

@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "core/file_sys/devices/logger.h"
 #include "core/libraries/kernel/file_system.h"
+#include "video_core/texture_cache/trace_window.h"
 
 namespace Core::Devices {
 
@@ -61,6 +62,7 @@ void Logger::log_flush() {
     } else {
         LOG_INFO(Tty, "[{}] {}", prefix, std::string_view{buffer});
     }
+    VideoCore::TraceWindow::OnGuestOutput(std::string_view{buffer});
     buffer.clear();
 }
 

@@ -377,6 +377,16 @@ struct AudioSettings {
     Setting<std::string> openal_padSpk_output_device{"Default Device"};
     Setting<u32> openal_hrtf{OpenALHrtfMode::HrtfAuto};
     Setting<u32> openal_output_mode{OpenALOutputMode::OutputAuto};
+    // Dynamic rate control of the output queue
+    Setting<bool> audio_drc{true};
+    Setting<u32> audio_drc_margin_ms{2};
+    Setting<bool> audio_drc_log{false};
+    // OpenAL Soft device options (handed over through a generated config file)
+    Setting<bool> openal_exclusive_mode{false};
+    Setting<u32> openal_period_frames{0};
+    // OpenAL backend following the output thread's period instead of sleeping to a schedule of
+    // its own
+    Setting<bool> openal_follow_output_timer{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -392,14 +402,27 @@ struct AudioSettings {
             make_override<AudioSettings>("openal_padSpk_output_device",
                                          &AudioSettings::openal_padSpk_output_device),
             make_override<AudioSettings>("openal_hrtf", &AudioSettings::openal_hrtf),
-            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode)};
+            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode),
+            make_override<AudioSettings>("audio_drc", &AudioSettings::audio_drc),
+            make_override<AudioSettings>("audio_drc_margin_ms",
+                                         &AudioSettings::audio_drc_margin_ms),
+            make_override<AudioSettings>("audio_drc_log", &AudioSettings::audio_drc_log),
+            make_override<AudioSettings>("openal_exclusive_mode",
+                                         &AudioSettings::openal_exclusive_mode),
+            make_override<AudioSettings>("openal_period_frames",
+                                         &AudioSettings::openal_period_frames),
+            make_override<AudioSettings>("openal_follow_output_timer",
+                                         &AudioSettings::openal_follow_output_timer)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
                                    sdl_main_output_device, sdl_padSpk_output_device,
                                    openal_mic_device, openal_main_output_device,
-                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode)
+                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode,
+                                   audio_drc, audio_drc_margin_ms, audio_drc_log,
+                                   openal_exclusive_mode, openal_period_frames,
+                                   openal_follow_output_timer)
 
 // -------------------------------
 // GPU settings
@@ -704,6 +727,12 @@ public:
 
     // Audio settings
     SETTING_FORWARD(m_audio, AudioBackend, audio_backend)
+    SETTING_FORWARD_BOOL(m_audio, AudioDrcEnabled, audio_drc)
+    SETTING_FORWARD(m_audio, AudioDrcMarginMs, audio_drc_margin_ms)
+    SETTING_FORWARD_BOOL(m_audio, AudioDrcLogEnabled, audio_drc_log)
+    SETTING_FORWARD_BOOL(m_audio, OpenALExclusiveMode, openal_exclusive_mode)
+    SETTING_FORWARD(m_audio, OpenALPeriodFrames, openal_period_frames)
+    SETTING_FORWARD_BOOL(m_audio, OpenALFollowOutputTimer, openal_follow_output_timer)
     SETTING_FORWARD(m_audio, SDLMicDevice, sdl_mic_device)
     SETTING_FORWARD(m_audio, SDLMainOutputDevice, sdl_main_output_device)
     SETTING_FORWARD(m_audio, SDLPadSpkOutputDevice, sdl_padSpk_output_device)

@@ -88,11 +88,14 @@ public:
     }
 
     ~OpenALPortBackend() override {
-        // Unregister port before cleanup
+        // Stop the source while its context is still alive. UnregisterPort drops the last port's
+        // context and closes the device, and after that Cleanup() can no longer make the context
+        // current: the source is still playing when the device goes away, which cuts the output
+        // mid-waveform. In WASAPI shared mode Windows hides it; in exclusive mode it is audible.
+        Cleanup();
         if (device_registered) {
             OpenALDevice::GetInstance().UnregisterPort(device_name);
         }
-        Cleanup();
     }
 
     void Output(void* ptr) override {
@@ -378,6 +381,10 @@ private:
         }
 
         if (source) {
+            // Mute first and give the mixer a couple of updates to hand the device silence, so
+            // the device buffer does not still hold audio when the device is closed.
+            alSourcef(source, AL_GAIN, 0.0f);
+            std::this_thread::sleep_for(std::chrono::microseconds(2 * period_us + 5000));
             alSourceStop(source);
 
             ALint queued = 0;

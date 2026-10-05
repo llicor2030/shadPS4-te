@@ -422,6 +422,11 @@ struct GPUSettings {
     Setting<bool> full_screen{false};
     Setting<std::string> full_screen_mode{"Windowed"};
     Setting<std::string> present_mode{"Mailbox"};
+    // Host vblank phase lock for Mailbox/Immediate (Windows)
+    Setting<bool> vsync_lock{true};
+    Setting<u32> vsync_lock_margin_ms{6};
+    Setting<bool> vsync_lock_log{false};
+    Setting<bool> vsync_drop_missed_vblanks{true};
     Setting<bool> hdr_allowed{false};
     Setting<bool> fsr_enabled{false};
     Setting<bool> rcas_enabled{true};
@@ -452,6 +457,11 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("vsync_lock", &GPUSettings::vsync_lock),
+            make_override<GPUSettings>("vsync_lock_margin_ms", &GPUSettings::vsync_lock_margin_ms),
+            make_override<GPUSettings>("vsync_lock_log", &GPUSettings::vsync_lock_log),
+            make_override<GPUSettings>("vsync_drop_missed_vblanks",
+                                       &GPUSettings::vsync_drop_missed_vblanks),
         };
     }
 };
@@ -461,7 +471,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader)
+                                   userfaultfd, inline_fetch_shader, vsync_lock,
+                                   vsync_lock_margin_ms, vsync_lock_log, vsync_drop_missed_vblanks)
 
 // -------------------------------
 // Vulkan settings
@@ -720,6 +731,10 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FullScreen, full_screen)
     SETTING_FORWARD(m_gpu, FullScreenMode, full_screen_mode)
     SETTING_FORWARD(m_gpu, PresentMode, present_mode)
+    SETTING_FORWARD_BOOL(m_gpu, VsyncLockEnabled, vsync_lock)
+    SETTING_FORWARD(m_gpu, VsyncLockMarginMs, vsync_lock_margin_ms)
+    SETTING_FORWARD_BOOL(m_gpu, VsyncLockLogEnabled, vsync_lock_log)
+    SETTING_FORWARD_BOOL(m_gpu, VsyncDropMissedVblanks, vsync_drop_missed_vblanks)
     SETTING_FORWARD(m_gpu, WindowHeight, window_height)
     SETTING_FORWARD(m_gpu, WindowWidth, window_width)
     SETTING_FORWARD(m_gpu, InternalScreenHeight, internal_screen_height)

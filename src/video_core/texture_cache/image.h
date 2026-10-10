@@ -58,6 +58,7 @@ struct UniqueImage {
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
+    [[nodiscard]] vk::Result TryCreate(const vk::ImageCreateInfo& image_ci);
 
     void Destroy();
 
@@ -95,6 +96,16 @@ struct Image : public Common::LRUNode<> {
 
     vk::Image GetImage() const {
         return backing->image.image;
+    }
+
+    vk::DeviceSize GetHostImageSize() const {
+        return backing->image.size_bytes;
+    }
+
+    /// Format the host image was created with. For depth this can be wider than the guest format
+    /// (D16 held as D24 or D32 where the device lacks it).
+    vk::Format GetImageFormat() const {
+        return backing->image.image_ci.format;
     }
 
     bool IsUntracked() {

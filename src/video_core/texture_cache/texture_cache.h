@@ -381,6 +381,10 @@ private:
     void SetTraceContent(const Image& image, std::string content);
     void MarkTraceRendered(const Image& image);
     void TraceCopy(const Image& dst, const Image& src, std::string_view what);
+    /// Stale-texture check: remembers the guest memory an upload took its data from.
+    void SetTraceUpload(const Image& image, u64 mem_hash, bool from_memory);
+    /// Stale-texture check: compares the textures a draw reads with guest memory.
+    void CheckStaleTextures(std::span<const TraceBinding> bindings);
 
 private:
     const Vulkan::Instance& instance;
@@ -418,6 +422,15 @@ private:
     struct TraceState {
         std::string content;   // what the image was last filled with (hash and source)
         bool rendered = false; // written by the GPU since then
+        // Stale-texture check. Only an image filled entirely from guest memory, and not written
+        // by the GPU or overwritten by a copy since, is expected to match guest memory.
+        bool from_memory = false;
+        u64 upload_hash = 0;
+        u64 upload_tick = 0;
+        u64 last_check_tick = 0;
+        u64 reported_hash = 0;
+        bool reported_gpu = false;
+        std::vector<std::string> history; // last tracking events (untrack, writes)
     };
     const bool texture_trace = IsTextureTraceEnabled();
     std::mutex trace_mutex;

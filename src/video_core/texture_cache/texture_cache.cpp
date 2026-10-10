@@ -226,6 +226,11 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
         if (image.info.guest_address != address) {
+            if (TraceOpen()) {
+                // Diagnostics only: the write covers part of this image but leaves it unmarked.
+                TraceImage(image, "gpu write (not marked)",
+                           fmt::format(" at {:#x}+{:#x}", address, max_size));
+            }
             return;
         }
         // Ensure image is reuploaded when accessed again.
@@ -811,6 +816,7 @@ void TextureCache::RefreshImage(Image& image) {
             TraceImage(image, "upload", " content " + content);
         }
         SetTraceContent(image, std::move(content));
+        SetTraceUpload(image, trace_mem_hash, !from_gpu_buffer && image_copies.size() == num_mips);
     }
 
     scheduler.EndRendering();
@@ -1114,6 +1120,18 @@ bool TextureCache::IsTextureTraceEnabled() {
 }
 
 void TextureCache::TraceImage(const Image& image, std::string_view event, std::string_view detail) {
+    if (event.starts_with("untrack") || event.starts_with("gpu write") || event == "cpu write" ||
+        event == "maybe dirty") {
+        // Stale-texture check: the last few ways this image's memory stopped being watched or
+        // was written, printed with a stale report.
+        constexpr size_t MaxHistory = 4;
+        std::scoped_lock lk{trace_mutex};
+        auto& history = trace_states[image.image_uid].history;
+        if (history.size() == MaxHistory) {
+            history.erase(history.begin());
+        }
+        history.push_back(fmt::format("t={} {}{}", scheduler.CurrentTick(), event, detail));
+    }
     // Every event while a window is open, with no per-image limit, so that each window holds the
     // complete story of the textures it uses and windows can be compared with each other.
     const auto& info = image.info;
@@ -1138,6 +1156,97 @@ void TextureCache::MarkTraceRendered(const Image& image) {
     trace_states[image.image_uid].rendered = true;
 }
 
+void TextureCache::SetTraceUpload(const Image& image, u64 mem_hash, bool from_memory) {
+    std::scoped_lock lk{trace_mutex};
+    auto& state = trace_states[image.image_uid];
+    state.from_memory = from_memory;
+    state.upload_hash = mem_hash;
+    state.upload_tick = scheduler.CurrentTick();
+    state.reported_hash = 0;
+    state.reported_gpu = false;
+}
+
+void TextureCache::CheckStaleTextures(std::span<const TraceBinding> bindings) {
+    // Diagnostics only. A texture the cache treats as current (no Dirty flag, never written by the
+    // GPU, filled entirely from guest memory) must still match guest memory; if it does not, a
+    // write reached that memory without invalidating the image and the GPU shows old contents.
+    constexpr u64 CheckIntervalTicks = 30;
+    const u64 tick = scheduler.CurrentTick();
+
+    struct Candidate {
+        ImageId image_id;
+        u64 upload_hash;
+    };
+    std::vector<Candidate> candidates;
+    {
+        std::scoped_lock lk{trace_mutex};
+        for (const auto& binding : bindings) {
+            if (binding.kind == "rt") {
+                continue;
+            }
+            const Image& image = slot_images[binding.image_id];
+            if (image.info.guest_address == 0 || image.info.num_samples > 1 ||
+                True(image.flags & (ImageFlagBits::Dirty | ImageFlagBits::GpuModified))) {
+                continue;
+            }
+            const auto it = trace_states.find(image.image_uid);
+            if (it == trace_states.end()) {
+                continue;
+            }
+            auto& state = it->second;
+            if (!state.from_memory || state.rendered ||
+                (state.last_check_tick != 0 && tick - state.last_check_tick < CheckIntervalTicks)) {
+                continue;
+            }
+            state.last_check_tick = tick;
+            candidates.push_back({binding.image_id, state.upload_hash});
+        }
+    }
+
+    // Guest memory is hashed without trace_mutex held: a read can fault into the page tracker,
+    // which logs through TraceImage and takes that lock.
+    for (const auto& candidate : candidates) {
+        const Image& image = slot_images[candidate.image_id];
+        const VAddr address = image.info.guest_address;
+        const u64 size = image.info.guest_size;
+        const bool gpu_range = buffer_cache.IsRegionGpuModified(address, size);
+        const u64 now_hash = gpu_range ? 0 : XXH3_64bits(std::bit_cast<const u8*>(address), size);
+        if (!gpu_range && now_hash == candidate.upload_hash) {
+            continue;
+        }
+        // A write caught by the tracker while hashing sets a Dirty flag before memory changes.
+        if (True(image.flags & ImageFlagBits::Dirty)) {
+            continue;
+        }
+        std::string detail;
+        {
+            std::scoped_lock lk{trace_mutex};
+            auto& state = trace_states[image.image_uid];
+            if (gpu_range ? state.reported_gpu : state.reported_hash == now_hash) {
+                continue;
+            }
+            std::string history;
+            for (const auto& entry : state.history) {
+                fmt::format_to(std::back_inserter(history), "{}{}", history.empty() ? "" : "; ",
+                               entry);
+            }
+            if (gpu_range) {
+                state.reported_gpu = true;
+                detail = fmt::format(" range written by the GPU (buffer cache), image not "
+                                     "GpuDirty; uploaded {:016x} at t={}; history: {}",
+                                     state.upload_hash, state.upload_tick,
+                                     history.empty() ? "none" : history);
+            } else {
+                state.reported_hash = now_hash;
+                detail = fmt::format(" uploaded {:016x} at t={} now {:016x}; history: {}",
+                                     state.upload_hash, state.upload_tick, now_hash,
+                                     history.empty() ? "none" : history);
+            }
+        }
+        TraceImage(image, gpu_range ? "stale? (gpu)" : "stale", detail);
+    }
+}
+
 void TextureCache::TraceCopy(const Image& dst, const Image& src, std::string_view what) {
     std::string content;
     {
@@ -1149,6 +1258,7 @@ void TextureCache::TraceCopy(const Image& dst, const Image& src, std::string_vie
                                          src_state.content.empty() ? "none" : src_state.content,
                                          src_state.rendered ? ", rendered" : "");
         dst_state.rendered |= src_state.rendered;
+        dst_state.from_memory = false;
         content = dst_state.content;
     }
     if (TraceOpen()) {
@@ -1183,6 +1293,7 @@ void TextureCache::TraceDraw(u64 pipeline_hash, std::span<const TraceBinding> bi
     if (!texture_trace || window == 0 || bindings.empty()) {
         return;
     }
+    CheckStaleTextures(bindings);
     // One line per distinct draw (pipeline plus every image it reads or renders to, with the
     // contents each image holds) per window. The same draw is listed again in the next window, so
     // windows can be compared directly.

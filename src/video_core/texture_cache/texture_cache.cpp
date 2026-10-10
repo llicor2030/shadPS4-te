@@ -544,7 +544,15 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& new_image = slot_images[new_image_id];
 
     RefreshImage(new_image);
-    runtime.CopyImage(&src_image, &new_image);
+    // The new image now holds what guest memory holds. The old image's contents only take
+    // precedence when they are newer than memory, i.e. rendered by the GPU and not overwritten
+    // since. A dirty old image is stale: memory at this address may already hold a different
+    // texture (a pool allocator placing a larger texture where a smaller one lived), and copying
+    // it would put the previous texture into the new one's first mips until it is reloaded.
+    if (True(src_image.flags & ImageFlagBits::GpuModified) &&
+        False(src_image.flags & ImageFlagBits::Dirty)) {
+        runtime.CopyImage(&src_image, &new_image);
+    }
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;

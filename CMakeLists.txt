@@ -19,6 +19,13 @@ endif()
 
 project(shadPS4 CXX C ASM ${ADDITIONAL_LANGUAGES})
 
+# Embedded debug info (/Z7) and shadPS4.pdb next to shadPS4.exe, for symbolizing crash reports.
+# /Z7 keeps ccache usable. Applies to every C/C++ target, externals included.
+option(SHADPS4_WIN_PDB "Emit shadPS4.pdb (MSVC-compatible toolchains only)" OFF)
+if (SHADPS4_WIN_PDB AND MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Z7>)
+endif()
+
 include(FetchContent)
 
 # Forcing PIE makes sure that the base address is high enough so that it doesn't clash with the PS4 memory.
@@ -1439,6 +1446,11 @@ if (WIN32)
         target_link_options(shadps4 PRIVATE /BASE:0x700000000000)
     else()
         target_link_options(shadps4 PRIVATE -Wl,--image-base=0x700000000000)
+    endif()
+
+    # /DEBUG alone would switch the linker to /OPT:NOREF,NOICF; keep the release behaviour.
+    if (MSVC AND SHADPS4_WIN_PDB)
+        target_link_options(shadps4 PRIVATE /DEBUG /OPT:REF /OPT:ICF)
     endif()
 endif()
 

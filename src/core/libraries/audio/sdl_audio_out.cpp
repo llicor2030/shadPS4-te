@@ -6,11 +6,13 @@
 #include <cstring>
 #include <memory>
 #include <thread>
+#include <vector>
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_hints.h>
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/audio/audio_rate_control.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/kernel/threads.h"
@@ -89,6 +91,8 @@ public:
         if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
             ManageAudioQueue();
         }
+
+        UpdatePlaybackRate(current_time);
 
         if (!SDL_PutAudioStreamData(stream, internal_buffer, internal_buffer_size)) [[unlikely]] {
             LOG_ERROR(Lib_AudioOut, "Failed to output to SDL audio stream: {}", SDL_GetError());
@@ -244,12 +248,47 @@ private:
         }
     }
 
+    // Holds the queue at its target: rebuild the cushion with silence when the queue is empty,
+    // otherwise trim the playback ratio by the queue level (see AudioRateControl).
+    void UpdatePlaybackRate(u64 current_time) {
+        if (!rate_control.Enabled() || stream_frame_bytes == 0) {
+            return;
+        }
+        const int queued = SDL_GetAudioStreamQueued(stream);
+        if (queued < 0) [[unlikely]] {
+            return;
+        }
+
+        const u32 queued_bytes = static_cast<u32>(queued);
+        if (queued_bytes == 0) {
+            // Start of playback, or the queue ran dry and a gap is already audible: put the
+            // cushion back at once instead of waiting for the trim to rebuild it.
+            if (started) {
+                rate_control.NoteUnderrun();
+            }
+            silence.assign(target_bytes, 0);
+            SDL_PutAudioStreamData(stream, silence.data(), static_cast<int>(target_bytes));
+        }
+        started = true;
+
+        const double ratio = rate_control.Update(
+            static_cast<double>(queued_bytes / stream_frame_bytes), current_time);
+        if (AudioRateControl::Differs(ratio, applied_ratio)) {
+            if (SDL_SetAudioStreamFrequencyRatio(stream, static_cast<float>(ratio))) {
+                applied_ratio = ratio;
+            } else {
+                LOG_ERROR(Lib_AudioOut, "Failed to set audio stream ratio: {}", SDL_GetError());
+            }
+        }
+    }
+
     void ManageAudioQueue() {
         const auto queued = SDL_GetAudioStreamQueued(stream);
 
         if (queued >= queue_threshold) [[unlikely]] {
             LOG_DEBUG(Lib_AudioOut, "Clearing backed up audio queue ({} >= {})", queued,
                       queue_threshold);
+            rate_control.NoteClear();
             SDL_ClearAudioStream(stream);
             CalculateQueueThreshold();
         }
@@ -496,6 +535,20 @@ private:
         const u32 sdl_buffer_size = sdl_buffer_frames * sizeof(float) * num_channels;
         queue_threshold = std::max(guest_buffer_size, sdl_buffer_size) * QUEUE_MULTIPLIER;
 
+        // Rate control works on the queue in input format (float, stream channel count).
+        stream_frame_bytes = buffer_frames > 0 ? internal_buffer_size / buffer_frames : 0;
+        const u32 device_frames =
+            sdl_buffer_frames > 0 ? static_cast<u32>(sdl_buffer_frames) : buffer_frames;
+        const u32 target_frames = rate_control.Configure(buffer_frames, device_frames, sample_rate);
+        target_bytes = target_frames * stream_frame_bytes;
+        if (rate_control.Enabled()) {
+            // Dropping the queue stays as a last resort, well above the level being held.
+            queue_threshold = std::max(queue_threshold, target_bytes * QUEUE_MULTIPLIER);
+            LOG_INFO(Lib_AudioOut,
+                     "Audio rate control: target {} frames ({:.1f} ms), device {} frames",
+                     target_frames, 1000.0 * target_frames / sample_rate, device_frames);
+        }
+
         LOG_DEBUG(Lib_AudioOut, "Audio queue threshold: {} bytes (SDL buffer: {} frames)",
                   queue_threshold, sdl_buffer_frames);
     }
@@ -654,6 +707,14 @@ private:
     // SDL audio stream
     SDL_AudioStream* stream{nullptr};
     u32 queue_threshold{0};
+
+    // Rate control
+    AudioRateControl rate_control;
+    double applied_ratio{1.0};
+    u32 stream_frame_bytes{0};
+    u32 target_bytes{0};
+    bool started{false};
+    std::vector<u8> silence;
 };
 
 std::unique_ptr<PortBackend> SDLAudioOut::Open(PortOut& port) {

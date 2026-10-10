@@ -51,6 +51,11 @@ foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
 endforeach()
+# D16 depth held in a D24 or D32 host image: 16-bit tiled side, 32-bit host side.
+add_host_shader(tiling.comp tiling_micro_16_depth_comp BITS_PER_PIXEL=16 LINEAR_BITS_PER_PIXEL=32
+                IS_MACRO_TILED=0)
+add_host_shader(tiling.comp tiling_macro_16_depth_comp BITS_PER_PIXEL=16 LINEAR_BITS_PER_PIXEL=32
+                IS_MACRO_TILED=1)
 
 list(REMOVE_DUPLICATES SHADER_FILES)
 add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS} SOURCES ${SHADER_FILES})

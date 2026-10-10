@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <map>
 #include <mutex>
 #include <span>
 #include <string>
@@ -141,6 +142,14 @@ public:
     [[nodiscard]] bool TraceOpen() const {
         return texture_trace && TraceWindow::Current() != 0;
     }
+
+    /// Texture trace: a write into guest memory that the emulator made itself (see
+    /// host_write_trace.h). Logs the cached images whose bytes it changed, and remembers where
+    /// it wrote for ReportHostWritesInImage.
+    void OnHostWrite(std::string_view what, VAddr addr, VAddr ctx_addr, u64 ctx_size,
+                     std::span<const u8> before, std::span<const u8> after);
+    /// Texture trace: lists the remembered emulator writes inside an image's range.
+    void ReportHostWritesInImage(const Image& image);
 
     /// Logs the images a draw used, once per distinct draw and window.
     void TraceDraw(u64 pipeline_hash, std::span<const TraceBinding> bindings);
@@ -437,6 +446,23 @@ private:
     absl::flat_hash_map<u64, TraceState> trace_states;
     std::unordered_set<u64> trace_draws_seen;
     u32 trace_draw_window = 0;
+    struct HostWriteStats {
+        u64 writes = 0;
+        u64 bytes = 0;
+        u64 image_writes = 0;
+    };
+    absl::flat_hash_map<std::string, HostWriteStats> host_write_stats;
+    u64 host_write_last_summary = 0;
+    struct HostWriteSite {
+        std::string_view kind; // names passed to HostWriteTrace are string literals
+        u64 size = 0;
+        u64 first_tick = 0;
+        u64 last_tick = 0;
+        u64 count = 0;
+        u64 last_value = 0; // first 8 bytes written, little endian
+    };
+    std::map<VAddr, HostWriteSite> host_write_sites;
+    u64 host_write_max_size = 0;
 };
 
 } // namespace VideoCore

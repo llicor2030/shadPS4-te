@@ -17,6 +17,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/host_write_trace.h"
 
 namespace AmdGpu {
 
@@ -180,6 +181,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+            const VideoCore::HostWriteTrace::Scope trace_write{
+                "dump const ram", std::bit_cast<VAddr>(dump_const->Address<void*>()),
+                dump_const->Size()};
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
             break;
@@ -649,6 +653,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
+                        const VideoCore::HostWriteTrace::Scope trace_write{
+                            "occlusion query", std::bit_cast<VAddr>(results),
+                            u64(num_counter_pairs) * 2 * sizeof(u64)};
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
@@ -664,6 +671,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
+                    const VideoCore::HostWriteTrace::Label trace_label{"eos fence"};
                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                 });
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
@@ -671,6 +679,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->Finish();
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                        const VideoCore::HostWriteTrace::Scope trace_write{
+                            "gds store", std::bit_cast<VAddr>(event_eos->Address()), sizeof(u32)};
                         *event_eos->Address() = value;
                     }
                 }
@@ -684,6 +694,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
+                        const VideoCore::HostWriteTrace::Label trace_label{"eop fence"};
                         ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
@@ -735,6 +746,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
+                    const VideoCore::HostWriteTrace::Scope trace_write{
+                        "write data", std::bit_cast<VAddr>(address), data_size};
                     std::memcpy(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
@@ -753,6 +766,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+                const VideoCore::HostWriteTrace::Scope trace_write{
+                    "semaphore", mem_semaphore->Address<VAddr>(), sizeof(u64)};
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
@@ -1077,6 +1092,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                const VideoCore::HostWriteTrace::Scope trace_write{
+                    "write data", std::bit_cast<VAddr>(write_data->Address<void*>()), data_size};
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
@@ -1085,6 +1102,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            const VideoCore::HostWriteTrace::Scope trace_write{
+                "semaphore", mem_semaphore->Address<VAddr>(), sizeof(u64)};
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
@@ -1108,6 +1127,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->OnFence();
             }
+            const VideoCore::HostWriteTrace::Scope trace_write{
+                "release mem", release_mem->Address<VAddr>(), sizeof(u64)};
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));

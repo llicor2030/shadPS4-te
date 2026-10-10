@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/host_write_trace.h"
 
 namespace Core {
 
@@ -180,6 +181,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     if (vmas_to_write.empty()) {
         return false;
     }
+    // Texture trace: these writes bypass page protection.
+    const VideoCore::HostWriteTrace::Scope trace_write{"backing write", virtual_addr, size, true};
 
     for (auto& vma : vmas_to_write) {
         auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;

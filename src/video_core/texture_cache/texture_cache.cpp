@@ -25,6 +25,10 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
+#include <thread>
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/texture_cache/host_write_trace.h"
+
 namespace VideoCore {
 
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
@@ -64,6 +68,16 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
 
+    if (texture_trace) {
+        HostWriteTrace::Register(
+            [](void* self, std::string_view what, VAddr addr, VAddr ctx_addr, u64 ctx_size,
+               std::span<const u8> before, std::span<const u8> after) {
+                static_cast<TextureCache*>(self)->OnHostWrite(what, addr, ctx_addr, ctx_size,
+                                                              before, after);
+            },
+            this);
+    }
+
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
     pressure_gc_samplers = max_samplers * 7 / 8;
@@ -96,7 +110,131 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
 }
 
-TextureCache::~TextureCache() = default;
+TextureCache::~TextureCache() {
+    HostWriteTrace::Unregister(this);
+}
+
+void TextureCache::OnHostWrite(std::string_view what, VAddr addr, VAddr ctx_addr, u64 ctx_size,
+                               std::span<const u8> before, std::span<const u8> after) {
+    if (!TraceOpen()) {
+        return;
+    }
+    constexpr u64 HostWriteSummaryTicks = 1000;
+    const u64 size = before.size();
+    u64 changed = 0;
+    for (u64 i = 0; i < size; ++i) {
+        changed += before[i] != after[i];
+    }
+    const u64 tick = scheduler.CurrentTick();
+    const std::string context =
+        ctx_size ? fmt::format(" for {:#x}+{:#x}", ctx_addr, ctx_size) : std::string{};
+    std::string summary;
+    {
+        std::scoped_lock lk{trace_mutex};
+        auto& stats = host_write_stats[std::string{what}];
+        ++stats.writes;
+        stats.bytes += changed;
+        auto& site = host_write_sites[addr];
+        if (site.count++ == 0) {
+            site.first_tick = tick;
+        }
+        site.kind = what;
+        site.size = std::max(site.size, size);
+        site.last_tick = tick;
+        site.last_value = 0;
+        std::memcpy(&site.last_value, after.data(), std::min<u64>(size, sizeof(u64)));
+        host_write_max_size = std::max(host_write_max_size, size);
+        if (tick - host_write_last_summary >= HostWriteSummaryTicks) {
+            host_write_last_summary = tick;
+            for (const auto& [name, entry] : host_write_stats) {
+                fmt::format_to(std::back_inserter(summary),
+                               "{}{}: {} writes, {} bytes changed, {} changed cached images",
+                               summary.empty() ? "" : "; ", name, entry.writes, entry.bytes,
+                               entry.image_writes);
+            }
+            fmt::format_to(std::back_inserter(summary), "; {} write sites remembered",
+                           host_write_sites.size());
+        }
+    }
+    if (!summary.empty()) {
+        LOG_INFO(Render_Vulkan, "TexTrace t={} host writes summary: {}", tick, summary);
+    }
+
+    // The page table of the cache belongs to the GPU thread.
+    if (!liverpool || std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
+        LOG_INFO(Render_Vulkan,
+                 "TexTrace t={} host write {} at {:#x}+{:#x}{}: {} bytes changed (not on the GPU "
+                 "thread, cached images not looked up) w={}",
+                 tick, what, addr, size, context, changed, TraceWindow::Current());
+        return;
+    }
+    SmallVector<ImageId, 8> image_ids;
+    ForEachImageInRegion(addr, size,
+                         [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+    for (const ImageId image_id : image_ids) {
+        const Image& image = slot_images[image_id];
+        const VAddr image_begin = image.info.guest_address;
+        const VAddr begin = std::max<VAddr>(addr, image_begin);
+        const VAddr end = std::min<VAddr>(addr + size, image_begin + image.info.guest_size);
+        u64 image_changed = 0;
+        u64 first = 0;
+        u64 last = 0;
+        for (VAddr a = begin; a < end; ++a) {
+            if (before[a - addr] != after[a - addr]) {
+                if (image_changed == 0) {
+                    first = a - image_begin;
+                }
+                last = a - image_begin;
+                ++image_changed;
+            }
+        }
+        if (image_changed == 0) {
+            continue;
+        }
+        {
+            std::scoped_lock lk{trace_mutex};
+            ++host_write_stats[std::string{what}].image_writes;
+        }
+        TraceImage(image, "host write",
+                   fmt::format(" {} at {:#x}+{:#x}{}: {} bytes of the image changed at "
+                               "+{:#x}..+{:#x}",
+                               what, addr, size, context, image_changed, first, last));
+    }
+}
+
+void TextureCache::ReportHostWritesInImage(const Image& image) {
+    const VAddr begin = image.info.guest_address;
+    const VAddr end = begin + image.info.guest_size;
+    std::vector<std::pair<VAddr, HostWriteSite>> sites;
+    {
+        std::scoped_lock lk{trace_mutex};
+        const VAddr from = begin > host_write_max_size ? begin - host_write_max_size : 0;
+        for (auto it = host_write_sites.lower_bound(from);
+             it != host_write_sites.end() && it->first < end; ++it) {
+            if (it->first + it->second.size > begin) {
+                sites.emplace_back(it->first, it->second);
+            }
+        }
+    }
+    if (sites.empty()) {
+        return;
+    }
+    std::ranges::sort(sites, [](const auto& a, const auto& b) {
+        return a.second.last_tick > b.second.last_tick;
+    });
+    constexpr size_t MaxListed = 8;
+    std::string list;
+    for (size_t i = 0; i < std::min(sites.size(), MaxListed); ++i) {
+        const auto& [addr, site] = sites[i];
+        fmt::format_to(
+            std::back_inserter(list), "{}{} at {:#x}+{:#x} (image {:+#x}) x{} t={}..{} last {:#x}",
+            list.empty() ? "" : "; ", site.kind, addr, site.size, static_cast<s64>(addr - begin),
+            site.count, site.first_tick, site.last_tick, site.last_value);
+    }
+    TraceImage(image, "host writes in range",
+               fmt::format(" {} site(s), most recent first: {}{}", sites.size(), list,
+                           sites.size() > MaxListed ? "; ..." : ""));
+}
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
@@ -147,6 +285,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         scheduler.Finish();
         download.Invalidate();
         ConvertDepthDownloadToGuest(download.mapped, num_texels, depth_conversion);
+        const HostWriteTrace::Label trace_label{"image readback"};
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
     } else {
@@ -154,6 +293,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                                           download_size, num_texels, depth_conversion] {
             download.Invalidate();
             ConvertDepthDownloadToGuest(download.mapped, num_texels, depth_conversion);
+            const HostWriteTrace::Label trace_label{"image readback"};
             Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                       download.mapped, download_size);
             runtime.GetStagingPool().FreeDeferred(download);
@@ -814,6 +954,7 @@ void TextureCache::RefreshImage(Image& image) {
         }
         if (TraceOpen()) {
             TraceImage(image, "upload", " content " + content);
+            ReportHostWritesInImage(image);
         }
         SetTraceContent(image, std::move(content));
         SetTraceUpload(image, trace_mem_hash, !from_gpu_buffer && image_copies.size() == num_mips);

@@ -14,7 +14,10 @@
 #include "emulator.h"
 
 #ifdef _WIN32
+#include <string>
+#include <string_view>
 #include <windows.h>
+#include "common/string_util.h"
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 #else
 #include <csignal>
@@ -28,8 +31,155 @@ namespace Core {
 
 #if defined(_WIN32)
 
+// Diagnostics for the unhandled-exception report. Everything here only reads: it queries the
+// address space before touching memory, and a fault while reporting ends the report instead of
+// recursing into the handler.
+enum class CrashReportState { Idle, Collecting, CutShort };
+static thread_local CrashReportState g_crash_report_state = CrashReportState::Idle;
+
+static bool IsReadableRange(u64 addr, u64 size) noexcept {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0 ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        return false;
+    }
+    constexpr DWORD Readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & Readable) == 0) {
+        return false;
+    }
+    const u64 region_end = reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize;
+    return addr + size >= addr && addr + size <= region_end;
+}
+
+static bool IsExecutableImage(u64 addr) noexcept {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    constexpr DWORD Executable =
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE && (mbi.Protect & Executable) != 0;
+}
+
+// "addr (module+offset)" for loaded images, otherwise the kind of allocation it belongs to.
+static std::string DescribeAddress(u64 addr) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) {
+        return fmt::format("{:#x} (not queryable)", addr);
+    }
+    if (mbi.State == MEM_FREE) {
+        return fmt::format("{:#x} (free)", addr);
+    }
+    const u64 alloc_base = reinterpret_cast<u64>(mbi.AllocationBase);
+    if (mbi.Type == MEM_IMAGE) {
+        HMODULE module{};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(addr), &module)) {
+            wchar_t path[MAX_PATH];
+            const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+            std::wstring_view name{path, length};
+            if (const auto slash = name.find_last_of(L"\\/"); slash != std::wstring_view::npos) {
+                name.remove_prefix(slash + 1);
+            }
+            return fmt::format("{:#x} ({}+{:#x})", addr, Common::UTF16ToUTF8(name),
+                               addr - reinterpret_cast<u64>(module));
+        }
+        return fmt::format("{:#x} (image {:#x}+{:#x})", addr, alloc_base, addr - alloc_base);
+    }
+    const char* kind = mbi.Type == MEM_MAPPED ? "mapped" : "private";
+    const char* state = mbi.State == MEM_COMMIT ? "" : ", reserved";
+    return fmt::format("{:#x} ({} {:#x}+{:#x}, protect {:#x}{})", addr, kind, alloc_base,
+                       addr - alloc_base, mbi.Protect, state);
+}
+
+static void LogCrashDetails(const EXCEPTION_POINTERS* pExp) noexcept {
+    if (pExp == nullptr || pExp->ExceptionRecord == nullptr || pExp->ContextRecord == nullptr) {
+        return;
+    }
+    g_crash_report_state = CrashReportState::Collecting;
+    const EXCEPTION_RECORD& record = *pExp->ExceptionRecord;
+    const CONTEXT& context = *pExp->ContextRecord;
+
+    LOG_CRITICAL(Debug, "Crash: instruction {}",
+                 DescribeAddress(reinterpret_cast<u64>(record.ExceptionAddress)));
+    if ((record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+         record.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+        record.NumberParameters >= 2) {
+        const u64 kind = record.ExceptionInformation[0];
+        const char* access = kind == 0 ? "read" : kind == 1 ? "write" : kind == 8 ? "execute" : "?";
+        LOG_CRITICAL(Debug, "Crash: {} of {}", access,
+                     DescribeAddress(record.ExceptionInformation[1]));
+    }
+    LOG_CRITICAL(Debug,
+                 "Crash: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} "
+                 "rsp={:#x}",
+                 context.Rax, context.Rbx, context.Rcx, context.Rdx, context.Rsi, context.Rdi,
+                 context.Rbp, context.Rsp);
+    LOG_CRITICAL(Debug,
+                 "Crash: r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} "
+                 "r15={:#x}",
+                 context.R8, context.R9, context.R10, context.R11, context.R12, context.R13,
+                 context.R14, context.R15);
+
+    // Values on the stack that point into executable images. Done before the unwind, which can
+    // fault on a corrupt stack and end the report.
+    constexpr u64 ScanSlots = 256;
+    constexpr int MaxHits = 32;
+    int hits = 0;
+    for (u64 slot = 0; slot < ScanSlots && hits < MaxHits; ++slot) {
+        const u64 slot_addr = context.Rsp + slot * sizeof(u64);
+        if (!IsReadableRange(slot_addr, sizeof(u64))) {
+            break;
+        }
+        const u64 value = *reinterpret_cast<const u64*>(slot_addr);
+        if (IsExecutableImage(value)) {
+            LOG_CRITICAL(Debug, "Crash: stack rsp+{:#x} {}", slot * sizeof(u64),
+                         DescribeAddress(value));
+            ++hits;
+        }
+    }
+
+    // Unwind with the images' unwind tables. Code without unwind data (guest code, generated
+    // code) is treated as a leaf, so frames past such code are only a guess.
+    CONTEXT frame = context;
+    for (int depth = 0; depth < 32 && frame.Rip != 0; ++depth) {
+        LOG_CRITICAL(Debug, "Crash: unwind #{:02} {}", depth, DescribeAddress(frame.Rip));
+        DWORD64 image_base{};
+        PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(frame.Rip, &image_base, nullptr);
+        if (function != nullptr) {
+            if (!IsReadableRange(frame.Rsp, sizeof(u64))) {
+                break;
+            }
+            PVOID handler_data{};
+            DWORD64 establisher_frame{};
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, frame.Rip, function, &frame,
+                             &handler_data, &establisher_frame, nullptr);
+        } else {
+            if (!IsReadableRange(frame.Rsp, sizeof(u64))) {
+                break;
+            }
+            frame.Rip = *reinterpret_cast<const u64*>(frame.Rsp);
+            frame.Rsp += sizeof(u64);
+        }
+    }
+    g_crash_report_state = CrashReportState::Idle;
+}
+
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
+    if (g_crash_report_state != CrashReportState::Idle) {
+        // A fault while collecting crash details (e.g. unwinding a corrupt stack): end the report
+        // here, flush the log as the normal path would, and leave the exception unhandled. Once
+        // cut short, this thread never reports again.
+        if (g_crash_report_state == CrashReportState::Collecting) {
+            g_crash_report_state = CrashReportState::CutShort;
+            LOG_CRITICAL(Debug, "Crash: details cut short by a fault while collecting them");
+            Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     const auto* signals = Signals::Instance();
 
     const bool use_static_windows_guest_red_zone_protection =
@@ -143,6 +293,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        LogCrashDetails(pExp);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

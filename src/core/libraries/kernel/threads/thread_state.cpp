@@ -41,6 +41,16 @@ void ThreadState::Collect(Pthread* curthread) {
                 ++it;
                 continue;
             }
+            // ExitThread publishes TidTerminated (so joiners can proceed) before the host thread
+            // is gone: it still has to wake the joiners and call native_thr->Exit(), on its own
+            // stack. Recycling it now lets Alloc() wipe the Pthread and hand out the stack under
+            // a thread that is still running, so the dying thread reads a freshly constructed
+            // NativeThread (native handle not set yet -> Exit() returns -> UNREACHABLE in
+            // ExitThread) or ends the new thread's bookkeeping instead of its own.
+            if (td->native_thr && !td->native_thr->HasExited()) {
+                ++it;
+                continue;
+            }
             FreeStack(&td->attr);
             work_list.push_back(td);
             it = gc_list.erase(it);

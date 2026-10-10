@@ -35,7 +35,16 @@ int NativeThread::Create(ThreadFunc func, void* arg) {
     if (native_handle == nullptr) {
         return GetLastError();
     }
+    exit_handle = native_handle;
     return 0;
+#endif
+}
+
+bool NativeThread::HasExited() const {
+#ifdef _WIN64
+    return exit_handle == nullptr || WaitForSingleObject(exit_handle, 0) == WAIT_OBJECT_0;
+#else
+    return true;
 #endif
 }
 

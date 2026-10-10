@@ -24,6 +24,10 @@ public:
     int Create(ThreadFunc func, void* arg);
     void Exit();
 
+    // True once the host thread has really terminated (not merely announced its exit).
+    // Only known on Windows; elsewhere this is always true.
+    bool HasExited() const;
+
     void Initialize();
 
     uintptr_t GetHandle() {
@@ -37,6 +41,7 @@ public:
 private:
 #ifdef _WIN64
     void* native_handle;
+    void* exit_handle = nullptr; // kept after Exit() clears native_handle
 #else
     uintptr_t native_handle;
     void* sig_stack_ptr = nullptr;

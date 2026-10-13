@@ -27,7 +27,7 @@ void SetCurrentThreadName(const char* name);
 void SetThreadName(void* thread, const char* name);
 
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
-                   bool interruptible);
+                   bool interruptible, bool high_resolution = false);
 
 class AccurateTimer {
     std::chrono::nanoseconds target_interval{};
@@ -35,12 +35,29 @@ class AccurateTimer {
 
     std::chrono::high_resolution_clock::time_point start_time;
 
+    bool drop_missed_intervals = false;
+    bool high_resolution_sleep = false;
+
 public:
     explicit AccurateTimer(std::chrono::nanoseconds target_interval);
 
     void Start();
 
     void End();
+
+    void SetTargetInterval(std::chrono::nanoseconds interval) {
+        target_interval = interval;
+    }
+
+    // Drop whole missed intervals instead of catching up with back-to-back iterations.
+    void SetDropMissedIntervals(bool enable) {
+        drop_missed_intervals = enable;
+    }
+
+    // Use a high-resolution waitable timer for the sleep in Start() (Windows only).
+    void SetHighResolutionSleep(bool enable) {
+        high_resolution_sleep = enable;
+    }
 
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;

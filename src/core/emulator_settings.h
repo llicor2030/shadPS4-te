@@ -199,6 +199,7 @@ struct GeneralSettings {
     Setting<int> big_picture_scale{1000};
     Setting<int> big_picture_folder_depth{2};
     Setting<bool> redzone_patches{false};
+    Setting<bool> frame_stats{false};
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -217,6 +218,7 @@ struct GeneralSettings {
             make_override<GeneralSettings>("trophy_notification_side",
                                            &GeneralSettings::trophy_notification_side),
             make_override<GeneralSettings>("console_language", &GeneralSettings::console_language),
+            make_override<GeneralSettings>("frame_stats", &GeneralSettings::frame_stats),
             make_override<GeneralSettings>("redzone_patches", &GeneralSettings::redzone_patches)};
     }
 };
@@ -227,7 +229,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    trophy_popup_disabled, trophy_notification_duration, show_splash,
                                    trophy_notification_side, discord_rpc_enabled, show_fps_counter,
                                    console_language, big_picture_scale, big_picture_folder_depth,
-                                   redzone_patches)
+                                   frame_stats, redzone_patches)
 
 // -------------------------------
 // Network settings
@@ -745,6 +747,7 @@ public:
     SETTING_FORWARD(m_general, ConsoleLanguage, console_language)
     SETTING_FORWARD(m_general, BigPictureScale, big_picture_scale)
     SETTING_FORWARD(m_general, BigPictureFolderDepth, big_picture_folder_depth)
+    SETTING_FORWARD_BOOL(m_general, FrameStatsEnabled, frame_stats)
     SETTING_FORWARD_BOOL(m_general, RedZonePatchingEnabled, redzone_patches)
 
     // Network settings

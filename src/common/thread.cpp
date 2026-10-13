@@ -4,14 +4,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ctime>
+#include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 #include <fmt/format.h>
 
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
 #include "common/error.h"
+#include "common/frame_stats.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "ntapi.h"
@@ -181,12 +184,79 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 
 #ifdef _WIN32
 
+// frame_stats: the efficiency class of the logical processor the calling thread runs on (0 is
+// the most power-efficient class; on hybrid CPUs the faster cores have higher classes).
+static u32 CurrentCoreClass() {
+    static const std::vector<u8> classes = [] {
+        std::vector<u8> result;
+        ULONG length = 0;
+        GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+        std::vector<u64> buffer((length + sizeof(u64) - 1) / sizeof(u64));
+        auto* const data = reinterpret_cast<u8*>(buffer.data());
+        if (length == 0 ||
+            !GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(data), length,
+                                        &length, GetCurrentProcess(), 0)) {
+            return result;
+        }
+        for (ULONG offset = 0; offset < length;) {
+            const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(data + offset);
+            if (info->Size == 0) {
+                break;
+            }
+            if (info->Type == CpuSetInformation) {
+                const u32 index = info->CpuSet.Group * 64U + info->CpuSet.LogicalProcessorIndex;
+                if (result.size() <= index) {
+                    result.resize(index + 1, 0);
+                }
+                result[index] = info->CpuSet.EfficiencyClass;
+            }
+            offset += info->Size;
+        }
+        return result;
+    }();
+    PROCESSOR_NUMBER number{};
+    GetCurrentProcessorNumberEx(&number);
+    const u32 index = number.Group * 64U + number.Number;
+    return index < classes.size() ? classes[index] : 0;
+}
+
+// frame_stats: reads the CPU time of the named threads.
+static void RegisterThreadCpuTime(const char* name) {
+    if (!Common::FrameStats::enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    Common::FrameStats::core_class_reader.store(&CurrentCoreClass, std::memory_order_relaxed);
+    HANDLE raw_handle{};
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &raw_handle,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        return;
+    }
+    const std::shared_ptr<void> handle{raw_handle, CloseHandle};
+    Common::FrameStats::RegisterThread(GetCurrentThreadId(), name, [handle] {
+        FILETIME creation{};
+        FILETIME exit_time{};
+        FILETIME kernel{};
+        FILETIME user{};
+        u64 ns = 0;
+        if (GetThreadTimes(handle.get(), &creation, &exit_time, &kernel, &user)) {
+            const auto ticks = [](const FILETIME& time) {
+                return (static_cast<u64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+            };
+            ns = (ticks(kernel) + ticks(user)) * 100;
+        }
+        ULONG64 cycles = 0;
+        QueryThreadCycleTime(handle.get(), &cycles);
+        return std::pair<u64, u64>{ns, static_cast<u64>(cycles)};
+    });
+}
+
 // Sets the debugger-visible name of the current thread.
 void SetCurrentThreadName(const char* name) {
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    RegisterThreadCpuTime(name);
 }
 
 void SetThreadName(void* thread, const char* name) {
@@ -201,6 +271,22 @@ void SetCurrentThreadName(const char* name) {
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
+#ifdef __linux__
+    // frame_stats: reads the CPU time of the named threads.
+    clockid_t cpu_clock{};
+    if (Common::FrameStats::enabled.load(std::memory_order_relaxed) &&
+        pthread_getcpuclockid(pthread_self(), &cpu_clock) == 0) {
+        Common::FrameStats::RegisterThread(static_cast<u64>(pthread_self()), name, [cpu_clock] {
+            timespec time{};
+            if (clock_gettime(cpu_clock, &time) != 0) {
+                return std::pair<u64, u64>{0, 0};
+            }
+            const u64 ns =
+                static_cast<u64>(time.tv_sec) * 1'000'000'000ULL + static_cast<u64>(time.tv_nsec);
+            return std::pair<u64, u64>{ns, 0};
+        });
+    }
+#endif
 #ifdef __APPLE__
     pthread_setname_np(name);
 #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)

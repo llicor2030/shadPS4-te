@@ -17,6 +17,7 @@
 
 #include "common/assert.h"
 #include "common/error.h"
+#include "common/frame_stats.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
@@ -364,10 +365,14 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
 static thread_local std::vector<u8> file_buf{};
 
 s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::FileRead};
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
     const auto remaining = file->GetSize() - file->Tell();
-    memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
+    {
+        const Common::FrameStats::Scope invalidate_stats{Common::FrameStats::Kind::FileInvalidate};
+        memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
+    }
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
@@ -376,6 +381,7 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
         return bytes;
     }
     std::memcpy(buf, file_buf.data(), bytes);
+    Common::FrameStats::CountFileRead(bytes);
     return bytes;
 }
 

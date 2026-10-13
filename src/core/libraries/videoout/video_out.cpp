@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/frame_stats.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
@@ -146,6 +147,7 @@ s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
 
 s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
     LOG_TRACE(Lib_VideoOut, "called");
+    Common::FrameStats::CountFlipPendingQuery();
     auto* port = driver->GetPort(handle);
     std::unique_lock lock{port->port_mutex};
     s32 pending = port->flip_status.flip_pending_num;

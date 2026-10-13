@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/texture_cache/depth_staging.h"
 
 namespace Vulkan {
 struct Runtime;
@@ -20,12 +21,17 @@ namespace VideoCore {
 struct ImageInfo;
 struct Image;
 
+TilingFormat GetTilingFormat(const ImageInfo& info, vk::Format host_format);
+u64 GuestToHostBytes(u64 guest_bytes, u32 guest_bytes_per_pixel, const TilingFormat& tiling_format);
+
 class TileManager {
     struct TilingKey {
         AmdGpu::TileMode tile_mode;
         u32 num_bits;
         u32 num_samples;
         bool is_tiler;
+        DepthConversion depth_conversion;
+        bool is_linear;
 
         bool operator==(const TilingKey&) const = default;
 
@@ -36,6 +42,8 @@ class TileManager {
                 boost::hash_combine(hash, key.num_bits);
                 boost::hash_combine(hash, key.num_samples);
                 boost::hash_combine(hash, key.is_tiler);
+                boost::hash_combine(hash, key.depth_conversion);
+                boost::hash_combine(hash, key.is_linear);
                 return hash;
             }
         };
@@ -50,10 +58,11 @@ public:
                    const VideoCore::Buffer* out_buffer, u64 out_offset);
 
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
-                                              const ImageInfo& info);
+                                              const ImageInfo& info, vk::Format host_format);
 
 private:
-    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);
+    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler,
+                                   DepthConversion depth_conversion, bool is_linear);
 
 private:
     const Vulkan::Instance& instance;

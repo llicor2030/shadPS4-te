@@ -5,6 +5,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/frame_stats.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
@@ -373,6 +374,7 @@ SignalDispatch::~SignalDispatch() {
 }
 
 bool SignalDispatch::DispatchAccessViolation(void* context, void* fault_address) const {
+    Common::FrameStats::CountAccessViolation();
     for (const auto& [handler, _] : access_violation_handlers) {
         if (handler(context, fault_address)) {
             return true;

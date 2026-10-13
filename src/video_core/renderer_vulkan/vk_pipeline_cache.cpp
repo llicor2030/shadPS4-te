@@ -3,6 +3,7 @@
 
 #include <ranges>
 
+#include "common/frame_stats.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -339,12 +340,14 @@ PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            vk::Format depth_stencil_format) {
+    const Common::FrameStats::ContextScope context{Common::FrameStats::Context::Pipeline};
     draw_indirect_params = params;
     if (!RefreshGraphicsKey(depth_stencil_format)) {
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Pipeline};
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
@@ -384,11 +387,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineForDepthFormat(
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    const Common::FrameStats::ContextScope context{Common::FrameStats::Context::Pipeline};
     if (!RefreshComputeKey()) {
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Pipeline};
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 

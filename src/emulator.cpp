@@ -13,6 +13,7 @@
 #include <hwinfo/hwinfo.h>
 
 #include "common/debug.h"
+#include "common/frame_stats.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
 #include "common/thread.h"
@@ -484,6 +485,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              EmulatorSettings.IsRedZonePatchingEnabled());
 #endif
     LOG_INFO(Config, "General p2pPort: {}", EmulatorSettings.GetP2PPort());
+    LOG_INFO(Config, "General isFrameStatsEnabled: {}", EmulatorSettings.IsFrameStatsEnabled());
+    if (EmulatorSettings.IsFrameStatsEnabled()) {
+        Common::FrameStats::Start();
+    }
     LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());
     LOG_INFO(Config, "Log skipDuplicate: {}", EmulatorSettings.IsLogSkipDuplicate());
 #ifdef _WIN32

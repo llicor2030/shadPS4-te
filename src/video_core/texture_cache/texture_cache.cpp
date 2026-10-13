@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/frame_stats.h"
 #include "common/hash.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -721,6 +722,7 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Upload};
     // Texture trace: hash of what guest memory holds now. No upload line after the refresh line
     // means the refresh was skipped because the contents looked unchanged.
     const u64 trace_mem_hash =

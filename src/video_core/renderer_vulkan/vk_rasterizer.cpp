@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "common/frame_stats.h"
 #include "common/hash.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -105,6 +106,7 @@ bool Rasterizer::FilterDraw() {
 }
 
 const GraphicsPipeline* Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::TargetLookup};
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -192,10 +194,14 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Draw};
+    Common::FrameStats::SampleGpuThreadCore();
 
     scheduler.PopPendingOperations();
 
+    Common::FrameStats::Phases phases;
     if (!FilterDraw()) {
+        phases.Mark(Common::FrameStats::Kind::DrawSkipped);
         return;
     }
 
@@ -204,11 +210,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
+    phases.Mark(Common::FrameStats::Kind::DrawPipeline);
 
     pipeline = PrepareRenderState(pipeline);
     if (!pipeline || !BindResources(pipeline)) {
         return;
     }
+    phases.Mark(Common::FrameStats::Kind::DrawResources);
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
@@ -219,10 +227,53 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    phases.Mark(Common::FrameStats::Kind::DrawBuffers);
 
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
+    phases.Mark(Common::FrameStats::Kind::DrawSetup);
+    if (Common::FrameStats::enabled.load(std::memory_order_relaxed)) {
+        using Common::FrameStats::Mix;
+        u64 targets = db_desc.image_id.index;
+        for (const auto& [image_id, desc] : cb_descs) {
+            targets = Mix(targets, image_id.index);
+        }
+        u64 buffers = 0;
+        u64 offsets = 0;
+        for (const auto& info : buffer_infos) {
+            buffers = Mix(buffers, reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)));
+            buffers = Mix(buffers, info.range);
+            offsets = Mix(offsets, info.offset);
+        }
+        u64 textures = 0;
+        for (const auto& info : image_infos) {
+            textures = Mix(textures, reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler)));
+            textures =
+                Mix(textures, reinterpret_cast<u64>(static_cast<VkImageView>(info.imageView)));
+            textures = Mix(textures, static_cast<u64>(info.imageLayout));
+        }
+        const u64 resources = Mix(Mix(buffers, offsets), textures);
+        Common::FrameStats::CountDrawRepeats(pipeline, targets, resources, regs.num_indices,
+                                             textures, buffers);
+        const u64 group = Mix(Mix(reinterpret_cast<u64>(pipeline), state.width),
+                              Mix(state.height, state.num_color_attachments));
+        Common::FrameStats::CountDrawGroup(
+            group, u64{regs.num_indices} * regs.num_instances.NumInstances(), [&] {
+                const auto stages = pipeline->GetStages();
+                const auto hash = [&](Shader::SwStage stage) -> u64 {
+                    const auto* info = stages[static_cast<u32>(stage)];
+                    return info ? info->pgm_hash : 0;
+                };
+                const auto& color = pipeline->GetGraphicsKey().color_buffers[0];
+                return fmt::format("vs {:#x} ps {:#x} rt {}x{} x{} fmt {}/{} depth {}",
+                                   hash(Shader::SwStage::Vertex), hash(Shader::SwStage::Fragment),
+                                   state.width, state.height, state.num_color_attachments,
+                                   static_cast<u32>(color.data_format),
+                                   static_cast<u32>(color.num_format),
+                                   state.depth_stencil_attachment.image_view ? 1 : 0);
+            });
+    }
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -241,12 +292,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
 
     ResetBindings(false);
+    phases.Mark(Common::FrameStats::Kind::DrawRecord);
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Draw};
 
     scheduler.PopPendingOperations();
 
@@ -326,6 +379,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Dispatch};
 
     scheduler.PopPendingOperations();
 
@@ -335,6 +389,13 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    Common::FrameStats::CountDispatchGroup(
+        reinterpret_cast<u64>(pipeline),
+        u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z, [&] {
+            return fmt::format("cs {:#x} first {}x{}x{}",
+                               pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
+                               cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+        });
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
@@ -361,6 +422,7 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Dispatch};
 
     scheduler.PopPendingOperations();
 
@@ -374,6 +436,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
+    Common::FrameStats::CountDispatchGroup(reinterpret_cast<u64>(pipeline), 0, [&] {
+        return fmt::format("cs {:#x} indirect",
+                           pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+    });
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
@@ -416,11 +482,13 @@ void Rasterizer::OnFence() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    const Common::FrameStats::ContextScope context{Common::FrameStats::Context::Resources};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
     }
 
+    Common::FrameStats::ResetDrawInputs();
     set_write_index = 0;
     set_writes.clear();
     buffer_infos.clear();
@@ -469,6 +537,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::VertexBinds};
+    Common::FrameStats::SampledPhases phases{Common::FrameStats::Kind::VertexSampled};
+    const Common::FrameStats::ContextScope context{Common::FrameStats::Context::VertexIndex};
     const auto& regs = liverpool->regs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -482,6 +553,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.setVertexInputEXT(bindings, attributes);
     }
+    phases.Mark(Common::FrameStats::Kind::VertexInputs);
 
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
@@ -524,14 +596,19 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         }
     }
 
+    phases.Mark(Common::FrameStats::Kind::VertexRanges);
+
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        Common::FrameStats::AddVertexBuffer(range.base_address, size);
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
+        phases.Mark(Common::FrameStats::Kind::VertexObtain);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
+        phases.Mark(Common::FrameStats::Kind::VertexAccess);
     }
 
     // Bind vertex buffers
@@ -566,9 +643,12 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
     }
+    phases.Mark(Common::FrameStats::Kind::VertexHostBind);
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::IndexBinds};
+    const Common::FrameStats::ContextScope context{Common::FrameStats::Context::VertexIndex};
     const auto& regs = liverpool->regs;
 
     // Figure out index type and size.
@@ -788,6 +868,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::BufferBinds};
     const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
         const auto src_access =
@@ -803,6 +884,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
+                Common::FrameStats::CountUserData(ubo_size);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
@@ -844,6 +926,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         } else {
             const auto vsharp = desc.GetSharp(stage);
+            Common::FrameStats::AddGuestBuffer(vsharp.base_address, vsharp.GetSize());
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
@@ -883,6 +966,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::TextureBinds};
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
@@ -1053,6 +1137,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::RenderPass};
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();

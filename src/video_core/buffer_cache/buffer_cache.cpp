@@ -5,6 +5,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
+#include "common/frame_stats.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -56,6 +57,19 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
+    {
+        VkMemoryPropertyFlags flags{};
+        vmaGetAllocationMemoryProperties(stream_buffer.buffer.allocator,
+                                         stream_buffer.buffer.allocation, &flags);
+        LOG_INFO(Render_Vulkan,
+                 "FrameStats stream buffer: {} MB, device local {}, host visible {}, host "
+                 "coherent {}, host cached {}, mapped {}",
+                 STREAM_BUFFER_SIZE >> 20, (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
+                 (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0,
+                 (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0,
+                 (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0,
+                 !stream_buffer.mapped_data.empty());
+    }
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -108,7 +122,12 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::Readback};
+    Common::FrameStats::CountReadback(device_addr, is_write, assume_locks);
     const auto flush_request = [this, device_addr, size, is_write] {
+        Common::FrameStats::CountReadbackTarget(device_addr,
+                                                gpu_modified_ranges.Intersects(device_addr, size));
+        const Common::FrameStats::Scope gpu_stats{Common::FrameStats::Kind::ReadbackGpu};
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -157,12 +176,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    Common::FrameStats::CountDownload(total_size_bytes, copies.size());
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
-    scheduler.Finish();
+    {
+        const Common::FrameStats::Scope finish_stats{Common::FrameStats::Kind::ReadbackFinish};
+        scheduler.Finish();
+    }
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
@@ -175,11 +198,21 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    Common::FrameStats::SampledPhases stats{Common::FrameStats::Kind::ObtainBuffer};
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    const bool use_stream =
+        !is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size);
+    stats.Mark(Common::FrameStats::Kind::ObtainCheck);
+    if (use_stream) {
+        Common::FrameStats::CountStreamCopy(size);
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+        stats.Mark(Common::FrameStats::Kind::ObtainMap);
         memory->CopySparseMemory(device_addr, data, size);
+        stats.Mark(Common::FrameStats::Kind::ObtainCopy);
         stream_buffer.Commit();
+        stats.Mark(Common::FrameStats::Kind::ObtainCommit);
+        Common::FrameStats::CheckStreamReuse(
+            device_addr, size, [&](u8* dst) { memory->CopySparseMemory(device_addr, dst, size); });
         return {&stream_buffer, offset};
     }
     const u64 first_block = device_addr >> block_shift;
@@ -190,6 +223,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
+    stats.Mark(Common::FrameStats::Kind::ObtainCache);
     return {arena, arena->Offset(device_addr)};
 }
 
@@ -287,6 +321,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (bind_ranges.Empty()) {
         return;
     }
+    const Common::FrameStats::Scope stats{Common::FrameStats::Kind::EnsureResident};
 
     const vk::MemoryAllocateFlagsInfo alloc_flags = {
         .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,

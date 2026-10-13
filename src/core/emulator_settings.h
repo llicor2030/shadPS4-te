@@ -313,14 +313,26 @@ struct DebugSettings {
     Setting<bool> debug_dump{false};         // specific
     Setting<bool> shader_collect{false};     // specific
     Setting<std::string> config_version{""}; // specific
+    // Log texture cache decisions and the textures each draw reads, to track down stale textures
+    Setting<bool> texture_trace{false};
+    // Text in the game's own output (stdout/stderr) that opens a trace window; empty traces always
+    Setting<std::string> texture_trace_trigger{""};
+    // How long a trace window stays open after the trigger text, in seconds
+    Setting<int> texture_trace_seconds{10};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
             make_override<DebugSettings>("debug_dump", &DebugSettings::debug_dump),
-            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect)};
+            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect),
+            make_override<DebugSettings>("texture_trace", &DebugSettings::texture_trace),
+            make_override<DebugSettings>("texture_trace_trigger",
+                                         &DebugSettings::texture_trace_trigger),
+            make_override<DebugSettings>("texture_trace_seconds",
+                                         &DebugSettings::texture_trace_seconds)};
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version,
+                                   texture_trace, texture_trace_trigger, texture_trace_seconds)
 
 // -------------------------------
 // Input settings
@@ -779,6 +791,9 @@ public:
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)
     SETTING_FORWARD_BOOL(m_debug, ShaderCollect, shader_collect)
     SETTING_FORWARD(m_debug, ConfigVersion, config_version)
+    SETTING_FORWARD_BOOL(m_debug, TextureTrace, texture_trace)
+    SETTING_FORWARD(m_debug, TextureTraceTrigger, texture_trace_trigger)
+    SETTING_FORWARD(m_debug, TextureTraceSeconds, texture_trace_seconds)
 
     // GPU Settings
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)

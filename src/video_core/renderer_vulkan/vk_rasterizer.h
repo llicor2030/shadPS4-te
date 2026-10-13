@@ -175,6 +175,11 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+
+    // Texture trace: the images the current draw reads and renders to, logged when it completes.
+    std::vector<VideoCore::TextureCache::TraceBinding> trace_bindings;
+    u64 trace_pipeline_hash{};
+    bool trace_draw{};
 };
 
 } // namespace Vulkan

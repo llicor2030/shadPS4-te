@@ -147,6 +147,16 @@ struct StreamBuffer : public Buffer {
         return last_tick;
     }
 
+    /// Number of times the buffer has wrapped around. A committed region keeps its contents while
+    /// the generation stays the same.
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
+
+    /// Marks a committed region of the current generation as used by the current tick: after the
+    /// buffer wraps around, the region is not overwritten until the GPU has finished that tick.
+    void Retain(u64 region_offset, u64 region_size);
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -175,6 +185,9 @@ private:
     /// Waits pending watches until requested upper bound.
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
 
+    /// Waits for the ticks of the regions retained in an earlier generation that overlap a region.
+    bool WaitRetained(u64 region_offset, u64 region_size, bool allow_wait);
+
 private:
     Vulkan::Scheduler& scheduler;
     vk::DeviceSize non_coherent_atom_size{};
@@ -187,6 +200,13 @@ private:
     std::vector<Watch> previous_watches;
     std::size_t wait_cursor{};
     u64 wait_bound{};
+    struct Retained {
+        u64 tick{}; ///< 0 when nothing is retained.
+        u64 generation{};
+    };
+    static constexpr u64 RETAIN_CHUNK_SIZE = 1ULL << 20;
+    std::vector<Retained> retained; ///< One per RETAIN_CHUNK_SIZE bytes, allocated on first use.
+    u64 generation{};
 };
 
 } // namespace VideoCore

@@ -603,7 +603,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         Common::FrameStats::AddVertexBuffer(range.base_address, size);
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
+            buffer_cache.ObtainBufferReused(range.base_address, size, false);
         phases.Mark(Common::FrameStats::Kind::VertexObtain);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
@@ -668,7 +668,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     u64 buffer_offset{};
     if (index_buffer_size != 0) {
         const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+            buffer_cache.ObtainBufferReused(index_address, index_buffer_size, false);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
@@ -708,6 +708,21 @@ void Rasterizer::ResetBindings(bool is_compute) {
     bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
+
+    // submit_every_draws: after this many draws recorded in one command buffer, submits them so
+    // that the host GPU starts on them before a later readback waits for them.
+    static const u32 submit_every_draws = EmulatorSettings.GetSubmitEveryDraws();
+    if (!is_compute && submit_every_draws != 0) {
+        static u64 counted_tick = 0;
+        static u32 counted_draws = 0;
+        if (scheduler.CurrentTick() != counted_tick) {
+            counted_tick = scheduler.CurrentTick();
+            counted_draws = 0;
+        }
+        if (++counted_draws >= submit_every_draws) {
+            Flush();
+        }
+    }
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -935,7 +950,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+                const auto [buffer, offset] = buffer_cache.ObtainBufferReused(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;

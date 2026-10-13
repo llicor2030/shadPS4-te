@@ -196,6 +196,7 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
     if (offset + size > this->size_bytes) {
         // The buffer would overflow, save the amount of used watches and reset the state.
         invalidation_mark = current_watch_cursor;
+        ++generation;
         current_watch_cursor = 0;
         offset = 0;
 
@@ -206,6 +207,9 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
     }
 
     if (!WaitPendingOperations(offset + size, allow_wait)) {
+        return false;
+    }
+    if (!WaitRetained(offset, size, allow_wait)) {
         return false;
     }
 
@@ -262,6 +266,42 @@ void StreamBuffer::AdvanceAndWatch() {
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
     watches.resize(watches.size() + grow_size);
+}
+
+void StreamBuffer::Retain(u64 region_offset, u64 region_size) {
+    if (region_size == 0) {
+        return;
+    }
+    if (retained.empty()) {
+        retained.resize((size_bytes + RETAIN_CHUNK_SIZE - 1) / RETAIN_CHUNK_SIZE);
+    }
+    const u64 tick = scheduler.CurrentTick();
+    last_tick = tick;
+    const u64 last_chunk = (region_offset + region_size - 1) / RETAIN_CHUNK_SIZE;
+    for (u64 chunk = region_offset / RETAIN_CHUNK_SIZE; chunk <= last_chunk; ++chunk) {
+        retained[chunk] = Retained{tick, generation};
+    }
+}
+
+bool StreamBuffer::WaitRetained(u64 region_offset, u64 region_size, bool allow_wait) {
+    if (retained.empty() || region_size == 0) {
+        return true;
+    }
+    const u64 last_chunk = (region_offset + region_size - 1) / RETAIN_CHUNK_SIZE;
+    for (u64 chunk = region_offset / RETAIN_CHUNK_SIZE; chunk <= last_chunk; ++chunk) {
+        auto& entry = retained[chunk];
+        if (entry.tick == 0 || entry.generation == generation) {
+            continue;
+        }
+        if (!scheduler.IsFree(entry.tick)) {
+            if (!allow_wait) {
+                return false;
+            }
+            scheduler.Wait(entry.tick);
+        }
+        entry.tick = 0;
+    }
+    return true;
 }
 
 bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_wait) {

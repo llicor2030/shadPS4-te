@@ -76,6 +76,12 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
+// cp_write_bypass: see BufferCache::WriteCpData.
+static bool IsCpWriteBypass() {
+    static const bool enabled = EmulatorSettings.IsCpWriteBypass();
+    return enabled;
+}
+
 void Liverpool::ProcessCommands() {
     // Process incoming commands with high priority
     while (num_commands) {
@@ -225,6 +231,35 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+// asc_yield_draws: on the real GPU the compute queues run alongside the graphics queue. Here one
+// thread processes all queues, and a graphics command buffer runs until it waits on something, so
+// compute work submitted meanwhile waits for the whole graphics command buffer. With this set, the
+// graphics task yields before every this-many draws or dispatches when compute work is pending.
+static u32 AscYieldDraws() {
+    static const u32 draws = EmulatorSettings.GetAscYieldDraws();
+    return draws;
+}
+
+static bool IsAscYieldOpcode(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static u32 gfx_work_since_asc_yield = 0;
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
@@ -246,6 +281,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
+
+        if (type == 3 && AscYieldDraws() != 0 && IsAscYieldOpcode(header->type3.opcode) &&
+            ++gfx_work_since_asc_yield >= AscYieldDraws()) {
+            gfx_work_since_asc_yield = 0;
+            // Submits other than the graphics ones are compute submits.
+            if (num_submits > mapped_queues[GfxQueueId].submits.size()) {
+                YIELD_GFX();
+                ProcessCommands();
+            }
+        }
 
         switch (type) {
         default:
@@ -659,7 +704,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
-                        pixel_counter += OcclusionCounterStep;
+                        // occlusion_query_hidden: the next dump writes the same value again, so
+                        // every query reports that no pixel passed (diagnostic only).
+                        static const bool occlusion_query_hidden =
+                            EmulatorSettings.IsOcclusionQueryHidden();
+                        if (!occlusion_query_hidden) {
+                            pixel_counter += OcclusionCounterStep;
+                        }
                     }
                 }
                 break;
@@ -1128,7 +1179,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                if (!IsCpWriteBypass() || !rasterizer ||
+                    !rasterizer->GetBufferCache().WriteCpData(
+                        std::bit_cast<VAddr>(write_data->Address<void*>()), write_data->data,
+                        data_size, true)) {
+                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                }
             } else {
                 UNREACHABLE();
             }
@@ -1165,6 +1221,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 },
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                     rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                },
+                [this](VAddr address, u64 data, u32 num_bytes) {
+                    if (!IsCpWriteBypass() || !rasterizer ||
+                        !rasterizer->GetBufferCache().WriteCpData(address, &data, num_bytes,
+                                                                  true)) {
+                        std::memcpy(std::bit_cast<void*>(address), &data, num_bytes);
+                    }
                 });
             break;
         }
@@ -1180,8 +1243,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
-            *queue.read_addr += next_dw_off;
-            *queue.read_addr %= queue.ring_size_dw;
+            // cp_write_bypass: shaders do not read the queue read pointer, so only the CPU copy
+            // is written.
+            const auto read_addr = std::bit_cast<VAddr>(queue.read_addr);
+            u32 read_dw{};
+            if (IsCpWriteBypass() && rasterizer &&
+                rasterizer->GetBufferCache().ReadCpData(read_addr, &read_dw, sizeof(read_dw))) {
+                read_dw = (read_dw + next_dw_off) % queue.ring_size_dw;
+                if (!rasterizer->GetBufferCache().WriteCpData(read_addr, &read_dw, sizeof(read_dw),
+                                                              false)) {
+                    *queue.read_addr = read_dw;
+                }
+            } else {
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
         }
     }
 

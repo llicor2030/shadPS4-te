@@ -474,6 +474,12 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    Setting<bool> stream_buffer_host{false};
+    Setting<bool> stream_copy_reuse{false};
+    Setting<u32> submit_every_draws{0};
+    Setting<bool> occlusion_query_hidden{false};
+    Setting<bool> cp_write_bypass{false};
+    Setting<u32> asc_yield_draws{0};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -498,6 +504,13 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("stream_buffer_host", &GPUSettings::stream_buffer_host),
+            make_override<GPUSettings>("stream_copy_reuse", &GPUSettings::stream_copy_reuse),
+            make_override<GPUSettings>("submit_every_draws", &GPUSettings::submit_every_draws),
+            make_override<GPUSettings>("occlusion_query_hidden",
+                                       &GPUSettings::occlusion_query_hidden),
+            make_override<GPUSettings>("cp_write_bypass", &GPUSettings::cp_write_bypass),
+            make_override<GPUSettings>("asc_yield_draws", &GPUSettings::asc_yield_draws),
             make_override<GPUSettings>("vsync_lock", &GPUSettings::vsync_lock),
             make_override<GPUSettings>("vsync_lock_margin_ms", &GPUSettings::vsync_lock_margin_ms),
             make_override<GPUSettings>("vsync_lock_log", &GPUSettings::vsync_lock_log),
@@ -512,7 +525,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader, vsync_lock,
+                                   userfaultfd, inline_fetch_shader, stream_buffer_host,
+                                   stream_copy_reuse, submit_every_draws, occlusion_query_hidden,
+                                   cp_write_bypass, asc_yield_draws, vsync_lock,
                                    vsync_lock_margin_ms, vsync_lock_log, vsync_drop_missed_vblanks)
 
 // -------------------------------
@@ -823,6 +838,12 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
+    SETTING_FORWARD_BOOL(m_gpu, StreamBufferHost, stream_buffer_host)
+    SETTING_FORWARD_BOOL(m_gpu, StreamCopyReuse, stream_copy_reuse)
+    SETTING_FORWARD(m_gpu, SubmitEveryDraws, submit_every_draws)
+    SETTING_FORWARD_BOOL(m_gpu, OcclusionQueryHidden, occlusion_query_hidden)
+    SETTING_FORWARD_BOOL(m_gpu, CpWriteBypass, cp_write_bypass)
+    SETTING_FORWARD(m_gpu, AscYieldDraws, asc_yield_draws)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

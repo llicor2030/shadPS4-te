@@ -90,6 +90,12 @@ public:
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
 
+    /// Like ObtainBuffer. With the stream_copy_reuse setting, a read-only buffer whose contents
+    /// match its last copy in the stream buffer reuses that copy instead of being copied again.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferReused(VAddr device_addr, u32 size,
+                                                                   bool is_written,
+                                                                   bool is_texel_buffer = false);
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 
@@ -98,6 +104,17 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+
+    /// cp_write_bypass: reads a few bytes for the command processor (the GPU thread) from a page
+    /// that is protected only because the GPU has written other bytes of it, without the access
+    /// fault and its readback. Returns false, and the caller accesses the memory directly as
+    /// before, when the page is not GPU-modified, when the bytes themselves were written by the
+    /// GPU, or when they cross a 16 KB backing page.
+    bool ReadCpData(VAddr address, void* data, u32 size);
+
+    /// cp_write_bypass: the same for a write. With update_gpu_copy, the cached GPU copy of the
+    /// bytes is written as well, in command order, so that shaders read the new value.
+    bool WriteCpData(VAddr address, const void* data, u32 size, bool update_gpu_copy);
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -129,6 +146,8 @@ private:
                            bool is_texel_buffer);
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
+
+    u8* CpDataBacking(VAddr address, u32 size);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;

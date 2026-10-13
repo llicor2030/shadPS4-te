@@ -2,11 +2,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <unordered_map>
 #include <magic_enum/magic_enum.hpp>
+#include <xxhash.h>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#endif
 
 #include "common/alignment.h"
 #include "common/frame_stats.h"
 #include "core/debug_state.h"
+#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -54,7 +63,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
-      stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+      stream_buffer{instance, scheduler,
+                    EmulatorSettings.IsStreamBufferHost() ? MemoryType::HostUncached
+                                                          : MemoryType::Stream,
+                    STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
     {
@@ -227,6 +239,147 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     return {arena, arena->Offset(device_addr)};
 }
 
+namespace {
+/// stream_copy_reuse: the last stream buffer copy of each guest address in the current stream
+/// buffer generation, with a 128-bit hash of its contents. Used by the thread that uses the
+/// stream buffer.
+struct StreamCopyReuse {
+    struct Entry {
+        u64 offset;
+        XXH128_hash_t hash;
+        u32 size;
+    };
+    static constexpr std::size_t MAX_ENTRIES = 1U << 16;
+    static constexpr u64 LOG_INTERVAL = 1ULL << 20;
+    std::unordered_map<VAddr, Entry> entries;
+    std::vector<u8> scratch;
+    u64 generation{};
+    u64 calls{};
+    u64 hits{};
+    u64 hit_bytes{};
+    u64 copied_bytes{};
+    u64 other_calls{};
+
+    // Times 1 call in SAMPLE_RATE, chosen at random: reading and hashing the guest memory, then
+    // the rest of the call (reusing the earlier copy, or copying into the stream buffer).
+    using Clock = std::chrono::steady_clock;
+    static constexpr u64 SAMPLE_RATE = 64;
+    u64 random_state = 0x9e3779b97f4a7c15ULL;
+    u64 sampled_hits{};
+    u64 sampled_copies{};
+    u64 read_ns{};
+    u64 hit_ns{};
+    u64 copy_ns{};
+
+    void Reset(u64 new_generation) {
+        entries.clear();
+        generation = new_generation;
+    }
+
+    bool Sample() {
+        random_state ^= random_state << 13;
+        random_state ^= random_state >> 7;
+        random_state ^= random_state << 17;
+        return (random_state >> 32) % SAMPLE_RATE == 0;
+    }
+
+    // Waits until the stores issued so far are complete, so that write-combined stores to the
+    // stream buffer are counted in the call that issued them.
+    static Clock::time_point TimedNow() {
+#if defined(_M_X64) || defined(__x86_64__)
+        _mm_mfence();
+#else
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+        return Clock::now();
+    }
+
+    static u64 Ns(Clock::time_point from, Clock::time_point to) {
+        return static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+    }
+
+    static u64 PerCall(u64 ns, u64 count) {
+        return count == 0 ? 0 : ns / count;
+    }
+};
+StreamCopyReuse stream_copy_reuse;
+} // Anonymous namespace
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferReused(VAddr device_addr, u32 size,
+                                                              bool is_written,
+                                                              bool is_texel_buffer) {
+    static const bool enabled = EmulatorSettings.IsStreamCopyReuse();
+    if (!enabled) {
+        return ObtainBuffer(device_addr, size, is_written, is_texel_buffer);
+    }
+    auto& reuse = stream_copy_reuse;
+    if (is_written || size == 0 || size > STREAM_THRESHOLD ||
+        IsRegionGpuModified(device_addr, size)) {
+        ++reuse.other_calls;
+        return ObtainBuffer(device_addr, size, is_written, is_texel_buffer);
+    }
+    if (++reuse.calls == StreamCopyReuse::LOG_INTERVAL) {
+        LOG_INFO(Render_Vulkan,
+                 "Stream copy reuse: {} of {} reused ({} KB), {} KB copied, {} other calls to "
+                 "ObtainBuffer, sampled time per call: read and hash {} ns, reuse {} ns, copy {} "
+                 "ns",
+                 reuse.hits, reuse.calls, reuse.hit_bytes / 1024, reuse.copied_bytes / 1024,
+                 reuse.other_calls,
+                 StreamCopyReuse::PerCall(reuse.read_ns, reuse.sampled_hits + reuse.sampled_copies),
+                 StreamCopyReuse::PerCall(reuse.hit_ns, reuse.sampled_hits),
+                 StreamCopyReuse::PerCall(reuse.copy_ns, reuse.sampled_copies));
+        reuse.calls = 0;
+        reuse.hits = 0;
+        reuse.hit_bytes = 0;
+        reuse.copied_bytes = 0;
+        reuse.other_calls = 0;
+        reuse.sampled_hits = 0;
+        reuse.sampled_copies = 0;
+        reuse.read_ns = 0;
+        reuse.hit_ns = 0;
+        reuse.copy_ns = 0;
+    }
+    const bool timed = reuse.Sample();
+    const auto start = timed ? StreamCopyReuse::TimedNow() : StreamCopyReuse::Clock::time_point{};
+    if (reuse.generation != stream_buffer.Generation()) {
+        reuse.Reset(stream_buffer.Generation());
+    }
+    reuse.scratch.resize(size);
+    memory->CopySparseMemory(device_addr, reuse.scratch.data(), size);
+    const XXH128_hash_t hash = XXH3_128bits(reuse.scratch.data(), size);
+    const auto hashed = timed ? StreamCopyReuse::TimedNow() : StreamCopyReuse::Clock::time_point{};
+    if (timed) {
+        reuse.read_ns += StreamCopyReuse::Ns(start, hashed);
+    }
+    const auto it = reuse.entries.find(device_addr);
+    if (it != reuse.entries.end() && it->second.size == size &&
+        XXH128_isEqual(it->second.hash, hash)) {
+        stream_buffer.Retain(it->second.offset, size);
+        ++reuse.hits;
+        reuse.hit_bytes += size;
+        if (timed) {
+            reuse.hit_ns += StreamCopyReuse::Ns(hashed, StreamCopyReuse::TimedNow());
+            ++reuse.sampled_hits;
+        }
+        return {&stream_buffer, it->second.offset};
+    }
+    const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+    std::memcpy(data, reuse.scratch.data(), size);
+    stream_buffer.Commit();
+    reuse.copied_bytes += size;
+    if (reuse.generation != stream_buffer.Generation() ||
+        reuse.entries.size() >= StreamCopyReuse::MAX_ENTRIES) {
+        reuse.Reset(stream_buffer.Generation());
+    }
+    reuse.entries.insert_or_assign(device_addr, StreamCopyReuse::Entry{offset, hash, size});
+    if (timed) {
+        reuse.copy_ns += StreamCopyReuse::Ns(hashed, StreamCopyReuse::TimedNow());
+        ++reuse.sampled_copies;
+    }
+    return {&stream_buffer, offset};
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     if (IsRegionGpuModified(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);
@@ -244,6 +397,49 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
+}
+
+u8* BufferCache::CpDataBacking(VAddr address, u32 size) {
+    constexpr u64 BackingPageSize = 16_KB;
+    if (size == 0 || address / BackingPageSize != (address + size - 1) / BackingPageSize ||
+        !memory_tracker->IsRegionGpuModified(address, size) ||
+        gpu_modified_ranges.Intersects(address, size)) {
+        return nullptr;
+    }
+    const auto* entry = memory->GetAddressSpace().BackingPages().find(address / BackingPageSize);
+    return entry && *entry ? *entry + address % BackingPageSize : nullptr;
+}
+
+bool BufferCache::ReadCpData(VAddr address, void* data, u32 size) {
+    const u8* backing = CpDataBacking(address, size);
+    if (backing == nullptr) {
+        return false;
+    }
+    std::memcpy(data, backing, size);
+    return true;
+}
+
+bool BufferCache::WriteCpData(VAddr address, const void* data, u32 size, bool update_gpu_copy) {
+    if (update_gpu_copy && (address % sizeof(u32) != 0 || size % sizeof(u32) != 0)) {
+        return false;
+    }
+    u8* backing = CpDataBacking(address, size);
+    if (backing == nullptr) {
+        return false;
+    }
+    std::memcpy(backing, data, size);
+    if (update_gpu_copy) {
+        const u64 first_block = address >> block_shift;
+        const u64 last_block = (address + size - 1) >> block_shift;
+        const auto* arena = GetArena(first_block, last_block);
+        EnsureResident(arena, first_block, last_block);
+        for (u32 offset = 0; offset < size; offset += sizeof(u32)) {
+            u32 value{};
+            std::memcpy(&value, static_cast<const u8*>(data) + offset, sizeof(value));
+            runtime.FillBuffer(arena, arena->Offset(address + offset), sizeof(value), value);
+        }
+    }
+    return true;
 }
 
 void BufferCache::SynchronizeDmaBuffers() {

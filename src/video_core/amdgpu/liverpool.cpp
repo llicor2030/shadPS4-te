@@ -884,12 +884,42 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         ProcessCommands();
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
+
+        // Type-2 packet are used for padding purposes. Recognise one before its dword is read as a
+        // type-3 length; otherwise a pad ending a submission is buffered as a packet head. While a
+        // buffered packet is pending, the submission starts with that packet's body instead.
+        if ((is_indirect || queue.tmp_dwords == 0) && header->type == 2) {
+            if (header->type3.NumWords() + 1 > acb.size()) [[unlikely]] {
+                LOG_WARNING(Lib_GnmDriver,
+                            "ASC split: vqid={} type-2 padding {:#010x} is the last dword of "
+                            "{}; main would have buffered it as a packet head",
+                            vqid, header->raw, is_indirect ? "an indirect buffer" : "a submission");
+            }
+            acb = NextPacket(acb, 1);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += 1;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            continue;
+        }
+
         u32 next_dw_off = header->type3.NumWords() + 1;
 
         // If we have a buffered packet, use it.
         if (queue.tmp_dwords > 0) [[unlikely]] {
             header = reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
             next_dw_off = header->type3.NumWords() + 1 - queue.tmp_dwords;
+            if (next_dw_off > acb.size()) {
+                LOG_WARNING(Lib_GnmDriver,
+                            "ASC split: vqid={} packet still incomplete after another submission "
+                            "({}/{} dwords); this is the case main mishandled",
+                            vqid, queue.tmp_dwords + acb.size(), header->type3.NumWords() + 1);
+            } else {
+                LOG_WARNING(Lib_GnmDriver,
+                            "ASC split: vqid={} packet completed ({} dwords, last {} from this "
+                            "submission)",
+                            vqid, header->type3.NumWords() + 1, next_dw_off);
+            }
             std::memcpy(queue.tmp_packet.data() + queue.tmp_dwords, acb.data(),
                         next_dw_off * sizeof(u32));
             queue.tmp_dwords = 0;
@@ -897,6 +927,30 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         // If the packet is split across ring boundary, buffer until next submission
         if (next_dw_off > acb.size()) [[unlikely]] {
+            if (reinterpret_cast<const u32*>(header) == acb.data()) {
+                // A new packet; the continuation case was logged above.
+                if constexpr (is_indirect) {
+                    LOG_WARNING(Lib_GnmDriver,
+                                "Indirect PM4 packet exceeds its buffer. Packet dwords={}, "
+                                "remaining dwords={}; main buffers it in the queue's packet "
+                                "buffer",
+                                next_dw_off, acb.size());
+                } else {
+                    const VAddr ring_off_dw =
+                        (reinterpret_cast<VAddr>(acb.data()) - queue.map_addr) / sizeof(u32);
+                    LOG_WARNING(Lib_GnmDriver,
+                                "ASC split: vqid={} packet opcode={:#x} dwords={} starts at ring "
+                                "dw {}, {} dwords in this submission, which ends at {}{}",
+                                vqid, static_cast<u32>(header->type3.opcode.Value()), next_dw_off,
+                                ring_off_dw, acb.size(),
+                                ring_off_dw + acb.size() == queue.ring_size_dw
+                                    ? "the ring end"
+                                    : "the write pointer (mid-packet doorbell)",
+                                next_dw_off > AscQueueInfo::Pm4BufferSize
+                                    ? "; larger than main's 1024-dword buffer"
+                                    : "");
+                }
+            }
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
@@ -904,17 +958,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 *queue.read_addr %= queue.ring_size_dw;
             }
             break;
-        }
-
-        if (header->type == 2) {
-            // Type-2 packet are used for padding purposes
-            next_dw_off = 1;
-            acb = NextPacket(acb, next_dw_off);
-            if constexpr (!is_indirect) {
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
-            }
-            continue;
         }
 
         if (header->type != 3) {
